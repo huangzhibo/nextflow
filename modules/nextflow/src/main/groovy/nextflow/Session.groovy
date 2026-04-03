@@ -560,11 +560,9 @@ class Session implements ISession {
 
     private void callIgniters() {
         log.debug "Igniting dataflow network (${igniters.size()})"
-        // Use index-based loop to support igniters added during iteration
-        // (e.g. deferred workflow execution via WorkflowInterceptor)
-        for( int i = 0; i < igniters.size(); i++ ) {
+        for( Closure action : igniters ) {
             try {
-                igniters.get(i).call()
+                action.call()
             }
             catch( Exception e ) {
                 log.error(e.message ?: "Failed to ignite dataflow network", e)
