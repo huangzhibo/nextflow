@@ -183,6 +183,7 @@ test_basic() {
     $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 }
 
 # Multi-emit channels (queue + value mixed).
@@ -195,6 +196,7 @@ test_multi_emit() {
     $NXF run "${TESTS_DIR}/test-multi-emit.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 1
+    assert_log_contains "Reusing archived stage"
 }
 
 # Value-channel-only emit.
@@ -206,6 +208,7 @@ test_value_channel() {
     between_runs
     $NXF run "${TESTS_DIR}/test-value-channel.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
+    assert_log_contains "Reusing archived stage"
 }
 
 # Single-file (non-tuple) emit.
@@ -217,6 +220,7 @@ test_single_file() {
     between_runs
     $NXF run "${TESTS_DIR}/test-single-file.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
+    assert_log_contains "Reusing archived stage"
 }
 
 # Two samples producing identically-named files must not collide in archive.
@@ -228,6 +232,7 @@ test_same_filename() {
     between_runs
     $NXF run "${TESTS_DIR}/test-same-filename.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
+    assert_log_contains "Reusing archived stage"
 
     local f1 f2
     f1=$(find .nf-stage-archive -path '*/0/report.txt' 2>/dev/null)
@@ -250,6 +255,7 @@ test_chain_last() {
     $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config --param_c v2 > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 2
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 }
 
 # 3-level chain, middle-stage param flip → middle + last invalidate.
@@ -262,6 +268,7 @@ test_chain_middle() {
     $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config --param_b v2 > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
     assert_cached_stages 1
+    assert_log_contains "Reusing archived stage"
 }
 
 # Fan-in: 2 producers → 1 collator.
@@ -274,6 +281,7 @@ test_fan_in() {
     $NXF run "${TESTS_DIR}/test-fan-in.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 3
+    assert_log_contains "Reusing archived stage"
 }
 
 # No stage scope in config → must behave like native Nextflow.
@@ -295,6 +303,7 @@ test_untracked_process() {
     $NXF run "${TESTS_DIR}/test-untracked-process.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 1
     assert_cached_stages 1
+    assert_log_contains "Reusing archived stage"
 }
 
 # Workflow calls workflow (recursive interception).
@@ -306,6 +315,7 @@ test_nested_workflow() {
     between_runs
     $NXF run "${TESTS_DIR}/test-nested-workflow.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
+    assert_log_contains "Reusing archived stage"
 }
 
 # Scale check: 10 samples × 2 stages.
@@ -318,6 +328,7 @@ test_many_samples() {
     $NXF run "${TESTS_DIR}/test-many-samples.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 }
 
 # Source-deletion recovery: input files vanish between runs; the 3-step
@@ -338,6 +349,7 @@ test_source_deleted() {
         --input_dir "${TEST_DIR}/sandbox" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 }
 
 # Cross-cluster portability: same content + name, different absolute path
@@ -357,18 +369,13 @@ test_cross_cluster() {
         --input_dir "${TEST_DIR}/sandbox_b" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 }
 
 # Pure-static stage: regression for a deadlock where runStage's
 # `clonedChannels.isEmpty()` branch synchronously called decide() on the
 # main thread, blocking on value-channel getVal() before the workflow
 # body's process could fire.
-#
-# Cache HITS for pure-static stages are recorded (TSV row, downstream
-# placeholders bound to archived emit), but the workflow's own process
-# still executes — the clone-trick only gates channel inputs, and a raw
-# `take` value is wired directly to the process by Nextflow's auto-wrap.
-# So the assertion here is "hit logged", not "process skipped".
 test_static_only() {
     write_config
     # Phase 1: cold, runs the process and archives.
@@ -425,6 +432,7 @@ EOF
     # Phase 3: readonly + pre-populated archive → cache hits.
     $NXF run "${TESTS_DIR}/test-basic.nf" -c readonly.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
+    assert_log_contains "Reusing archived stage"
 }
 
 # 3-step fallback: source files missing AND no historical archive → throw.
@@ -465,6 +473,7 @@ test_file_content_change() {
     $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
+    assert_log_contains "Reusing archived stage"
 
     between_runs
     # Modify content → both stages invalidate (channel emission digest changes,
