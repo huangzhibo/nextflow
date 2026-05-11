@@ -1,9 +1,5 @@
-# Runtime artifacts from `run-tests.sh` — never commit
+# Ad-hoc Nextflow runs from this directory create these.
+# `run-tests.sh` itself runs in mktemp dirs and produces nothing here.
 .nextflow/
 .nextflow.log*
 work/
-work-*/
-.nf-stage-archive*/
-cached-stages-*.tsv
-.stage-test-*.config
-.stage-noplugin-*.config

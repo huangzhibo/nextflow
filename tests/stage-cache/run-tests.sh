@@ -1,31 +1,83 @@
 #!/bin/bash
 #
-# Stage cache integration test suite (M2 scope: normal mode only).
-# Run from the tests/stage-cache/ directory.
+# Stage cache integration test suite.
 #
-# Usage: ./run-tests.sh [test_name]
-#   - no args:   run all tests
-#   - test_name: run a single test (e.g. ./run-tests.sh basic)
+# Each test runs in its own mktemp -d directory; passing tests are wiped,
+# failing tests preserve their working directory for inspection (path
+# printed to stdout).
 #
-# Override NXF env to point at a different Nextflow build:
+# Usage:
+#   ./run-tests.sh             # run all tests
+#   ./run-tests.sh basic       # run a single test by name
+#
+# Override the Nextflow binary:
 #   NXF=nextflow ./run-tests.sh        # use system-installed nextflow
 #   NXF=../../launch.sh ./run-tests.sh # use fork dev build (default)
 
 set -uo pipefail
 
-NXF=${NXF:-../../launch.sh}
+TESTS_DIR=$(cd "$(dirname "$0")" && pwd)
+NXF=${NXF:-${TESTS_DIR}/../../launch.sh}
+DATA_DIR="${TESTS_DIR}/data"
+
 PASS=0
 FAIL=0
-LAST_OUTPUT=$(mktemp)
 TEST_FAILED=0
-TEST_ID=""
+TEST_DIR=""
+LAST_OUTPUT=""
 
-cleanup() {
-    rm -rf ".nextflow" "work-${TEST_ID}" ".nf-stage-archive-${TEST_ID}" \
-           "cached-stages-${TEST_ID}.tsv" ".stage-test-${TEST_ID}.config" \
-           ".stage-noplugin-${TEST_ID}.config" \
-           "sandbox-${TEST_ID}-a" "sandbox-${TEST_ID}-b" 2>/dev/null || true
+# ----------------------------------------------------------------------
+# Test framework
+# ----------------------------------------------------------------------
+
+# Per-test sandbox: mktemp dir + symlink to shared data + cd into it.
+setup_test_dir() {
+    TEST_DIR=$(mktemp -d -t stage-cache.XXXXXX)
+    LAST_OUTPUT="${TEST_DIR}/.nf-output"
+    cd "$TEST_DIR"
+    ln -s "$DATA_DIR" data
 }
+
+# Stage-cache-enabled config (default for most tests).
+write_config() {
+    cat > stage.config <<'EOF'
+stage {
+    archiveRoot      = '.nf-stage-archive'
+    cachedStagesFile = 'cached-stages.tsv'
+}
+workDir = 'work'
+params {
+    reference       = 'GRCh38'
+    dbsnp           = 'dbsnp154'
+    param_b         = 'v1'
+    param_c         = 'v1'
+    expected_total  = 100
+    summary_version = 'v1'
+}
+EOF
+}
+
+# Baseline config WITHOUT stage scope (verifies native-behavior fall-through).
+write_noplugin_config() {
+    cat > noplugin.config <<'EOF'
+workDir = 'work'
+params {
+    reference       = 'GRCh38'
+    dbsnp           = 'dbsnp154'
+    param_b         = 'v1'
+    param_c         = 'v1'
+    expected_total  = 100
+    summary_version = 'v1'
+}
+EOF
+}
+
+# Drop session + work between two runs; keep the archive.
+between_runs() {
+    rm -rf .nextflow .nextflow.log* work
+}
+
+# -- assertions --
 
 assert_completed() {
     local expected=$1
@@ -34,23 +86,16 @@ assert_completed() {
     if [[ "$actual" != "$expected" ]]; then
         echo "  ASSERT FAILED: expected completed=${expected}, got completed=${actual}"
         TEST_FAILED=1
-        return 1
     fi
 }
 
 assert_cached_stages() {
     local expected=$1
-    local tsv="cached-stages-${TEST_ID}.tsv"
-    local actual
-    if [[ ! -f "$tsv" ]]; then
-        actual=0
-    else
-        actual=$(tail -n +2 "$tsv" | wc -l | tr -d ' ')
-    fi
+    local actual=0
+    [[ -f cached-stages.tsv ]] && actual=$(tail -n +2 cached-stages.tsv | wc -l | tr -d ' ')
     if [[ "$actual" != "$expected" ]]; then
         echo "  ASSERT FAILED: expected ${expected} cached stages, got ${actual}"
         TEST_FAILED=1
-        return 1
     fi
 }
 
@@ -58,7 +103,6 @@ assert_file_exists() {
     if [[ ! -f "$1" ]]; then
         echo "  ASSERT FAILED: file not found: $1"
         TEST_FAILED=1
-        return 1
     fi
 }
 
@@ -66,324 +110,223 @@ assert_log_contains() {
     if ! grep -qF "$1" "$LAST_OUTPUT"; then
         echo "  ASSERT FAILED: log does not contain: $1"
         TEST_FAILED=1
-        return 1
     fi
 }
 
+# Runner: setup → eval test fn → tear down (or preserve on failure).
 run_test() {
     local name=$1
     local fn=$2
-    TEST_ID="${name//[^a-zA-Z0-9]/-}-$$"
     TEST_FAILED=0
+    setup_test_dir
     echo ""
     echo "=== TEST: ${name} ==="
     eval "$fn"
+    cd "$TESTS_DIR"
     if [[ $TEST_FAILED -eq 0 ]]; then
         echo "  PASS"
+        rm -rf "$TEST_DIR"
         ((PASS++))
     else
-        echo "  FAIL"
+        echo "  FAIL (artifacts preserved at ${TEST_DIR})"
         ((FAIL++))
     fi
-    cleanup
 }
 
-# Generate per-test nextflow.config with stage block + params
-test_config() {
-    cat > ".stage-test-${TEST_ID}.config" << EOF
-stage {
-    archiveRoot      = '.nf-stage-archive-${TEST_ID}'
-    cachedStagesFile = 'cached-stages-${TEST_ID}.tsv'
-}
-workDir = 'work-${TEST_ID}'
-params {
-    reference = 'GRCh38'
-    dbsnp = 'dbsnp154'
-    param_b = 'v1'
-    param_c = 'v1'
-    expected_total = 100
-    summary_version = 'v1'
-}
-EOF
-    echo ".stage-test-${TEST_ID}.config"
-}
+# ----------------------------------------------------------------------
+# Tests
+# ----------------------------------------------------------------------
 
-# Generate per-test config WITHOUT stage scope (no-cache baseline)
-noplugin_config() {
-    cat > ".stage-noplugin-${TEST_ID}.config" << EOF
-workDir = 'work-${TEST_ID}'
-params {
-    reference = 'GRCh38'
-    dbsnp = 'dbsnp154'
-    param_b = 'v1'
-    param_c = 'v1'
-    expected_total = 100
-    summary_version = 'v1'
-}
-EOF
-    echo ".stage-noplugin-${TEST_ID}.config"
-}
-
-between_runs() {
-    # keep archive, drop session/work for next run
-    rm -rf ".nextflow" "work-${TEST_ID}" 2>/dev/null || true
-}
-
-# ------------------------------------------------------------------
-# Test 1: Basic archive and restore
-# ------------------------------------------------------------------
+# Basic archive + restore (2 stages × 2 samples = 4 tasks).
 test_basic() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-basic.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
 
     between_runs
-    $NXF run test-basic.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
-    rm -f "$cfg"
 }
 
-# Note: dropped test-partial-rerun.nf — structurally identical to
-# test-chain.nf (3-stage chain + 2 params); the partial-invalidation
-# semantics are covered by chain-last + chain-middle.
-
-# ------------------------------------------------------------------
-# Test 2: Multi-emit channels
-# ------------------------------------------------------------------
+# Multi-emit channels (queue + value mixed).
 test_multi_emit() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-multi-emit.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-multi-emit.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
 
     between_runs
-    $NXF run test-multi-emit.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-multi-emit.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 1
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 5: Value channel emit
-# ------------------------------------------------------------------
+# Value-channel-only emit.
 test_value_channel() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-value-channel.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-value-channel.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 2
 
     between_runs
-    $NXF run test-value-channel.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-value-channel.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 6: Single file emit (not tuple)
-# ------------------------------------------------------------------
+# Single-file (non-tuple) emit.
 test_single_file() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-single-file.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-single-file.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 2
 
     between_runs
-    $NXF run test-single-file.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-single-file.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 7: Same filename across samples
-# ------------------------------------------------------------------
+# Two samples producing identically-named files must not collide in archive.
 test_same_filename() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-same-filename.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-same-filename.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 2
 
     between_runs
-    $NXF run test-same-filename.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-same-filename.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
 
     local f1 f2
-    f1=$(find ".nf-stage-archive-${TEST_ID}" -path "*/0/report.txt" 2>/dev/null)
-    f2=$(find ".nf-stage-archive-${TEST_ID}" -path "*/1/report.txt" 2>/dev/null)
+    f1=$(find .nf-stage-archive -path '*/0/report.txt' 2>/dev/null)
+    f2=$(find .nf-stage-archive -path '*/1/report.txt' 2>/dev/null)
     assert_file_exists "$f1"
     assert_file_exists "$f2"
     if diff -q "$f1" "$f2" > /dev/null 2>&1; then
         echo "  ASSERT FAILED: same-name files should have different content"
         TEST_FAILED=1
     fi
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 8: Three-level chain - change last param
-# ------------------------------------------------------------------
+# 3-level chain, last-stage param flip → only last stage invalidates.
 test_chain_last() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-chain.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 6
 
     between_runs
-    $NXF run test-chain.nf -c "$cfg" -work-dir "work-${TEST_ID}" --param_c v2 > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config --param_c v2 > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 2
     assert_cached_stages 2
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 9: Three-level chain - change middle param
-# ------------------------------------------------------------------
+# 3-level chain, middle-stage param flip → middle + last invalidate.
 test_chain_middle() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-chain.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 6
 
     between_runs
-    $NXF run test-chain.nf -c "$cfg" -work-dir "work-${TEST_ID}" --param_b v2 > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-chain.nf" -c stage.config --param_b v2 > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
     assert_cached_stages 1
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 10: Fan-in stage
-# ------------------------------------------------------------------
+# Fan-in: 2 producers → 1 collator.
 test_fan_in() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-fan-in.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-fan-in.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 6
 
     between_runs
-    $NXF run test-fan-in.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-fan-in.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 3
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 11: No-plugin compatibility (stage scope absent → behaves like native)
-# ------------------------------------------------------------------
+# No stage scope in config → must behave like native Nextflow.
 test_no_plugin() {
-    local cfg; cfg=$(noplugin_config)
-    # -C (uppercase) ignores nextflow.config in launch dir
-    $NXF -C "$cfg" run test-basic.nf -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_noplugin_config
+    # -C (uppercase) ignores the launch-dir nextflow.config entirely.
+    $NXF -C noplugin.config run "${TESTS_DIR}/test-basic.nf" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
-    rm -f "$cfg"
 }
 
-# Note: dropped untracked-channel — the same pattern (Channel.of → named
-# workflow) is already covered by basic.nf; our hook fires after spread
-# so "untracked" channels need no special handling.
-
-# ------------------------------------------------------------------
-# Test 11: Untracked process output passed to named workflow
-# ------------------------------------------------------------------
+# A process emits files outside the stage cache, then a named workflow
+# receives them — hook must accept untracked-process inputs.
 test_untracked_process() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-untracked-process.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-untracked-process.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 3
 
     between_runs
-    $NXF run test-untracked-process.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-untracked-process.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 1
     assert_cached_stages 1
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 14: Nested named workflows (workflow calls workflow)
-# ------------------------------------------------------------------
+# Workflow calls workflow (recursive interception).
 test_nested_workflow() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-nested-workflow.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-nested-workflow.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 6
 
     between_runs
-    $NXF run test-nested-workflow.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-nested-workflow.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test 15: Many samples (10 samples)
-# ------------------------------------------------------------------
+# Scale check: 10 samples × 2 stages.
 test_many_samples() {
-    local cfg; cfg=$(test_config)
-    $NXF run test-many-samples.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    write_config
+    $NXF run "${TESTS_DIR}/test-many-samples.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 20
 
     between_runs
-    $NXF run test-many-samples.nf -c "$cfg" -work-dir "work-${TEST_ID}" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-many-samples.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
-    rm -f "$cfg"
 }
 
-# Note: dropped many-samples-rerun — chain-last/chain-middle already
-# verify partial-invalidation propagation; many-samples is kept as a
-# scale-only test.
-
-# NOTE: A "multi-emit ChannelOut passthrough" test was intentionally
-# omitted. Nextflow's TypeCheckingVisitor rejects calls where the
-# parsed argument count doesn't match the callee's declared parameter
-# count, regardless of runtime ChannelOut.spread expansion. So
-# `WORKFLOW(channelOutSize2)` to a 2-input workflow is a parse error,
-# meaning the "size>1 broken in nf-stage" scenario can't actually be
-# written by users and there's nothing for us to test here.
-
-# ------------------------------------------------------------------
-# Test: source-deleted recovery (3-step fallback step 3 → archive scan)
-# Files vanish between runs; digest must still be recoverable from the
-# stage's own prior archive (which recorded path → checksum in `take`).
-# ------------------------------------------------------------------
+# Source-deletion recovery: input files vanish between runs; the 3-step
+# fallback must recover via this stage's own prior archive scan.
 test_source_deleted() {
-    local cfg; cfg=$(test_config)
-    local sandbox="sandbox-${TEST_ID}-a"
-    mkdir -p "$sandbox"
-    cp data/sample1.fq data/sample2.fq "$sandbox/"
+    write_config
+    mkdir sandbox
+    cp data/sample1.fq data/sample2.fq sandbox/
 
-    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
-        --input_dir "$sandbox" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-relocate.nf" -c stage.config \
+        --input_dir "${TEST_DIR}/sandbox" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
 
     between_runs
-    rm -f "$sandbox/sample1.fq" "$sandbox/sample2.fq"
+    rm -f sandbox/sample1.fq sandbox/sample2.fq
 
-    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
-        --input_dir "$sandbox" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-relocate.nf" -c stage.config \
+        --input_dir "${TEST_DIR}/sandbox" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Test: cross-cluster portability (path excluded from hash)
-# Files relocated to a different absolute path between runs but content
-# and filename unchanged; digest must match across the two locations.
-# ------------------------------------------------------------------
+# Cross-cluster portability: same content + name, different absolute path
+# between runs must hit the same archive (path excluded from hash).
 test_cross_cluster() {
-    local cfg; cfg=$(test_config)
-    local sandbox_a="sandbox-${TEST_ID}-a"
-    local sandbox_b="sandbox-${TEST_ID}-b"
-    mkdir -p "$sandbox_a" "$sandbox_b"
-    cp data/sample1.fq data/sample2.fq "$sandbox_a/"
-    cp data/sample1.fq data/sample2.fq "$sandbox_b/"
+    write_config
+    mkdir sandbox_a sandbox_b
+    cp data/sample1.fq data/sample2.fq sandbox_a/
+    cp data/sample1.fq data/sample2.fq sandbox_b/
 
-    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
-        --input_dir "$sandbox_a" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-relocate.nf" -c stage.config \
+        --input_dir "${TEST_DIR}/sandbox_a" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
 
     between_runs
-    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
-        --input_dir "$sandbox_b" > "$LAST_OUTPUT" 2>&1 || true
+    $NXF run "${TESTS_DIR}/test-relocate.nf" -c stage.config \
+        --input_dir "${TEST_DIR}/sandbox_b" > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 0
     assert_cached_stages 2
-    rm -f "$cfg"
 }
 
-# ------------------------------------------------------------------
-# Run tests
-# ------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Entry
+# ----------------------------------------------------------------------
+
 declare -a ALL_TESTS=(
     "basic              test_basic"
     "multi-emit         test_multi_emit"
@@ -402,7 +345,6 @@ declare -a ALL_TESTS=(
 )
 
 if [[ $# -eq 1 ]]; then
-    # filter to single test by name prefix
     pattern=$1
     matched=0
     for spec in "${ALL_TESTS[@]}"; do
@@ -434,5 +376,4 @@ echo "================================"
 echo "Results: ${PASS} passed, ${FAIL} failed"
 echo "================================"
 
-rm -f "$LAST_OUTPUT"
 [[ $FAIL -eq 0 ]]

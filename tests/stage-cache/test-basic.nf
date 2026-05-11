@@ -1,3 +1,4 @@
+// Reused by: test_basic, test_no_plugin (run-tests.sh)
 process FASTP {
     input:
     tuple val(meta), path(fastq)

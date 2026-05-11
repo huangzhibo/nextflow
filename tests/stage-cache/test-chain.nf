@@ -1,4 +1,6 @@
 /*
+ * Reused by: test_chain_last, test_chain_middle (run-tests.sh)
+ *
  * Test: three-level chained stages A → B → C.
  * Verifies digest propagation through the chain.
  *
