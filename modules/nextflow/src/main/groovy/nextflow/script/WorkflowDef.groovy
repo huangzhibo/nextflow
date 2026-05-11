@@ -20,6 +20,7 @@ import groovy.transform.CompileStatic
 import groovy.transform.PackageScope
 import groovy.util.logging.Slf4j
 import groovyx.gpars.dataflow.DataflowWriteChannel
+import nextflow.cache.stage.StageCache
 import nextflow.exception.MissingProcessException
 import nextflow.exception.MissingValueException
 import nextflow.exception.ScriptRuntimeException
@@ -201,6 +202,12 @@ class WorkflowDef extends BindableDef implements ChainableDef, IterableDef, Exec
         final closure = body.closure
         closure.setDelegate(binding)
         closure.setResolveStrategy(Closure.DELEGATE_FIRST)
+
+        // stage cache hook — applies only to named workflows when configured
+        if( name != null && StageCache.instance.isEnabled() ) {
+            return runStaged(closure)
+        }
+
         final result = closure.call()
         if( name == null ) {
             // return the last statement if entry workflow (used for testing)
@@ -211,6 +218,24 @@ class WorkflowDef extends BindableDef implements ChainableDef, IterableDef, Exec
             output = collectOutputs(declaredOutputs)
             return output
         }
+    }
+
+    private Object runStaged(Closure closure) {
+        final inputs = new LinkedHashMap<String, Object>()
+        for( final inputName : declaredInputs ) {
+            inputs.put(inputName, binding.getVariable(inputName))
+        }
+        final result = StageCache.instance.runStage(this, inputs, {
+            for( final entry : inputs.entrySet() ) {
+                binding.setVariable(entry.key, entry.value)
+            }
+            closure.call()
+            output = collectOutputs(declaredOutputs)
+            return output
+        })
+        if( result instanceof ChannelOut )
+            output = (ChannelOut) result
+        return result
     }
 
 }

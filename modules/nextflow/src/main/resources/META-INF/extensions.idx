@@ -15,6 +15,7 @@
 #
 
 nextflow.cache.DefaultCacheFactory
+nextflow.cache.stage.StageConfig
 nextflow.conda.CondaConfig
 nextflow.config.ConfigMap
 nextflow.config.Manifest
