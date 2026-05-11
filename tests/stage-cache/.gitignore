@@ -1,0 +1,9 @@
+# Runtime artifacts from `run-tests.sh` — never commit
+.nextflow/
+.nextflow.log*
+work/
+work-*/
+.nf-stage-archive*/
+cached-stages-*.tsv
+.stage-test-*.config
+.stage-noplugin-*.config
