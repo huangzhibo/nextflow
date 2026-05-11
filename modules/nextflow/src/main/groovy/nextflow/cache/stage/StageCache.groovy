@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
+import groovyx.gpars.dataflow.Dataflow
 import groovyx.gpars.dataflow.DataflowWriteChannel
 import nextflow.Channel
 import nextflow.Global
@@ -124,9 +125,28 @@ class StageCache {
         final placeholders = buildPlaceholders(realOutput)
 
         if( clonedChannels.isEmpty() ) {
-            // pure-static stage: compute take immediately
+            // Pure-static stage (no channel inputs in `take:`). Two notes:
+            //
+            //   1. Dispatch decide() to a GPars worker thread. archiveWithForward
+            //      uses blocking getVal() on value-channel emits, which would
+            //      deadlock on the main thread — the workflow body has registered
+            //      the process but the task can't fire until the Nextflow barrier
+            //      starts, which can't start until entry workflow returns, which
+            //      can't return until this call does.
+            //
+            //   2. Cache hits *are* recorded and downstream placeholders are
+            //      bound to archived emit, but the workflow's own process is
+            //      not gated. Without channel inputs there is no clone we own —
+            //      Nextflow auto-wraps the raw `take:` value into a channel
+            //      when invoking the process, so by the time decide() resolves
+            //      the hit, the process has already been scheduled. The
+            //      orphaned process output is harmless (no downstream subscribers)
+            //      but its execution cost is paid. Users who care can wrap the
+            //      take value explicitly: WORKFLOW(Channel.value(params.x)).
             final take = StageTake.build(workflow.name, inputs, null, null, archive0, knownChecksums)
-            decide(workflow.name, take, realOutput, placeholders, clonedChannels, null)
+            Dataflow.task {
+                decide(workflow.name, take, realOutput, placeholders, clonedChannels, null)
+            }
         }
         else {
             subscribeAndCollect(workflow.name, inputs, realOutput, placeholders, clonedChannels)

@@ -350,6 +350,37 @@ test_cross_cluster() {
     assert_cached_stages 2
 }
 
+# Pure-static stage: regression for a deadlock where runStage's
+# `clonedChannels.isEmpty()` branch synchronously called decide() on the
+# main thread, blocking on value-channel getVal() before the workflow
+# body's process could fire.
+#
+# Cache HITS for pure-static stages are recorded (TSV row, downstream
+# placeholders bound to archived emit), but the workflow's own process
+# still executes — the clone-trick only gates channel inputs, and a raw
+# `take` value is wired directly to the process by Nextflow's auto-wrap.
+# So the assertion here is "hit logged", not "process skipped".
+test_static_only() {
+    write_config
+    # Phase 1: cold, must complete without deadlocking.
+    $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 1
+    assert_cached_stages 0
+
+    between_runs
+    # Phase 2: warm, same param — cache hit recorded.
+    $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_log_contains "Reusing archived stage VERSION_REPORT"
+    assert_cached_stages 1
+
+    between_runs
+    # Phase 3: different param, must miss (no hit recorded for this run).
+    $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config --summary_version v9 \
+        > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 1
+    assert_cached_stages 0
+}
+
 # Readonly mode: stage.writable=false must (a) not create an archive on
 # miss, (b) still serve hits when the archive exists.
 test_readonly() {
@@ -451,6 +482,7 @@ declare -a ALL_TESTS=(
     "many-samples       test_many_samples"
     "source-deleted     test_source_deleted"
     "cross-cluster      test_cross_cluster"
+    "static-only        test_static_only"
     "readonly           test_readonly"
     "source-deleted-no-archive  test_source_deleted_no_archive"
     "file-content-change        test_file_content_change"
