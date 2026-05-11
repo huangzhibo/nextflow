@@ -26,6 +26,7 @@ import nextflow.extension.CH
 import nextflow.script.ChannelOut
 import spock.lang.Specification
 import spock.lang.TempDir
+import spock.util.concurrent.PollingConditions
 
 class StageArchiveTest extends Specification {
 
@@ -153,13 +154,14 @@ class StageArchiveTest extends Specification {
         and:
         def placeholderOut = CH.create(true)
         def placeholders = ['out': placeholderOut] as Map<String, groovyx.gpars.dataflow.DataflowWriteChannel>
+        def conditions = new PollingConditions(timeout: 2)
 
         when:
         archive.archiveWithForward('STAGE', take, output, placeholders)
         then:
         def stageDir = archive.archivePath('STAGE', take.archiveDirName())
         def stageJson = stageDir.resolve('stage.json')
-        Files.exists(stageJson)
+        conditions.eventually { assert Files.exists(stageJson) }
         def data = new JsonSlurper().parse(stageJson.toFile()) as Map
         data.schema_version == 'v1'
         data.stage == 'STAGE'
@@ -193,6 +195,7 @@ class StageArchiveTest extends Specification {
             'total' : CH.create(true),
             'counts': CH.create(false)
         ] as Map<String, groovyx.gpars.dataflow.DataflowWriteChannel>
+        def conditions = new PollingConditions(timeout: 2)
 
         when:
         archive.archiveWithForward('STAGE', take, output, placeholders)
@@ -200,12 +203,10 @@ class StageArchiveTest extends Specification {
         queueCh.bind([id: 'S1'])
         queueCh.bind([id: 'S2'])
         queueCh.bind(Channel.STOP)
-        // give async subscription a moment
-        Thread.sleep(200)
 
         then:
         def stageJson = archive.archivePath('STAGE', take.archiveDirName()).resolve('stage.json')
-        Files.exists(stageJson)
+        conditions.eventually { assert Files.exists(stageJson) }
         def data = new JsonSlurper().parse(stageJson.toFile()) as Map
         and: 'total stays a value channel with exactly 1 item = 100'
         data.emit.total.type == 'value'

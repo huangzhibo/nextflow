@@ -29,7 +29,6 @@ import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
-import groovyx.gpars.dataflow.DataflowReadChannel
 import groovyx.gpars.dataflow.DataflowWriteChannel
 import nextflow.Channel
 import nextflow.extension.CH
@@ -173,44 +172,27 @@ class StageArchive {
 
         final collected = new LinkedHashMap<String, List<Object>>()
         final channelTypes = new LinkedHashMap<String, String>()
-        int queueCount = 0
-
         for( final name : names ) {
-            final ch = output.getProperty(name)
-            final isValue = CH.isValue(ch)
+            final isValue = CH.isValue(output.getProperty(name))
             channelTypes.put(name, isValue ? 'value' : 'queue')
-            if( isValue ) {
-                final value = ((DataflowReadChannel) ch).getVal()
-                collected.put(name, [value] as List<Object>)
-                final dstCh = placeholders.get(name)
-                if( dstCh != null ) dstCh.bind(value)
-            }
-            else {
-                collected.put(name, Collections.synchronizedList(new ArrayList<Object>()))
-                queueCount++
-            }
+            collected.put(name, Collections.synchronizedList(new ArrayList<Object>()))
         }
 
-        if( queueCount == 0 ) {
-            writeArchive(stageName, take, collected, channelTypes)
-            return
-        }
-
-        final pending = new AtomicInteger(queueCount)
+        final pending = new AtomicInteger(names.size())
         for( final name : names ) {
-            if( channelTypes.get(name) == 'value' ) continue
             // per-iteration capture: closures fire asynchronously, must not
             // share the loop variable across iterations
             final String capturedName = name
             final DataflowWriteChannel capturedDst = placeholders.get(capturedName)
             final readCh = CH.getReadChannel(output.getProperty(capturedName))
+            final boolean capturedIsValue = channelTypes.get(capturedName) == 'value'
             DataflowHelper.subscribeImpl(readCh, [
                 onNext: { Object value ->
                     collected.get(capturedName).add(value)
                     if( capturedDst != null ) capturedDst.bind(value)
                 } as Closure,
                 onComplete: {
-                    if( capturedDst != null ) capturedDst.bind(Channel.STOP)
+                    if( capturedDst != null && !capturedIsValue ) capturedDst.bind(Channel.STOP)
                     if( pending.decrementAndGet() == 0 )
                         writeArchive(stageName, take, collected, channelTypes)
                 } as Closure

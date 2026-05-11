@@ -24,7 +24,6 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
-import groovyx.gpars.dataflow.Dataflow
 import groovyx.gpars.dataflow.DataflowWriteChannel
 import nextflow.Channel
 import nextflow.Global
@@ -50,23 +49,15 @@ import nextflow.script.WorkflowDef
  * <ul>
  *   <li><b>Pure-static</b> (no channel inputs): digest is computable up front.
  *       On HIT, {@code proceed} is never called — the workflow's processes are
- *       neither registered nor executed. On MISS, {@code proceed} runs normally;
- *       archive writing is dispatched to a worker thread because
- *       {@link StageArchive#archiveWithForward} blocks on {@code getVal()} for
- *       value-channel emits. See {@link #runStageStatic}.</li>
+ *       neither registered nor executed. On MISS, {@code proceed} runs and
+ *       {@link StageArchive#archiveWithForward} registers async subscriptions
+ *       that capture emissions as they arrive. See {@link #runStageStatic}.</li>
  *   <li><b>Has-channel</b>: clone-substitute pattern — channel inputs are
  *       replaced with empty clones, the body wires processes onto the clones,
  *       and on first emit (from a worker thread) we decide hit/miss and
  *       either feed archived data and STOP the clones (gating processes) or
  *       feed real input through.</li>
  * </ul>
- *
- * <p>Why the main thread can't do blocking emit reads: {@code runStage} is
- * invoked synchronously from the entry workflow body. The Nextflow task
- * barrier doesn't dispatch any process until that body returns; blocking on
- * a value-channel {@code getVal} on the main thread would wait for a process
- * that can never fire. Worker threads (GPars or subscription callbacks)
- * sidestep this.
  *
  * <p>{@link #knownChecksums} is a per-run registry used by
  * {@link StageTake#computeFileChecksum} for the source-deletion fallback —
@@ -180,19 +171,15 @@ class StageCache {
         log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
         final realOutput = proceed.call() as ChannelOut
         final placeholders = buildPlaceholders(realOutput)
-        // archiveWithForward blocks on getVal() for value emits; dispatch off the
-        // main thread so the entry-workflow barrier can start and processes can fire.
-        Dataflow.task {
-            try {
-                if( config0.writable )
-                    archive0.archiveWithForward(stageName, take, realOutput, placeholders)
-                else
-                    forwardOutputs(realOutput, placeholders)
-            }
-            catch( Exception e ) {
-                log.error "Stage ${stageName} archive write failed, forwarding without archive: ${e.message}", e
+        try {
+            if( config0.writable )
+                archive0.archiveWithForward(stageName, take, realOutput, placeholders)
+            else
                 forwardOutputs(realOutput, placeholders)
-            }
+        }
+        catch( Exception e ) {
+            log.error "Stage ${stageName} archive write failed, forwarding without archive: ${e.message}", e
+            forwardOutputs(realOutput, placeholders)
         }
         return new ChannelOut(placeholders)
     }
