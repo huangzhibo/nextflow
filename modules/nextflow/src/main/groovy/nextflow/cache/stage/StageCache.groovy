@@ -19,11 +19,11 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
-import groovyx.gpars.dataflow.DataflowReadChannel
 import groovyx.gpars.dataflow.DataflowWriteChannel
 import nextflow.Channel
 import nextflow.Global
@@ -36,7 +36,7 @@ import nextflow.script.WorkflowDef
 /**
  * Stage cache orchestrator.
  *
- * Lifecycle:
+ * <p>Lifecycle:
  * <ol>
  *   <li>{@link WorkflowDef#run0} calls {@link #isEnabled} to gate the hook</li>
  *   <li>If enabled, the hook calls {@link #runStage} with a snapshot of the
@@ -44,10 +44,15 @@ import nextflow.script.WorkflowDef
  *       {@code proceed} closure that runs the workflow body</li>
  * </ol>
  *
- * The clone-substitute pattern (see comments on {@link #runStage}) is the only
- * way to defer execution between {@code closure.call()} (which synchronously
- * registers processes) and the asynchronous {@code archive.findArchive}
- * decision (which has to wait for input channels to drain).
+ * <p>The clone-substitute pattern is the only way to defer execution between
+ * {@code closure.call()} (which synchronously registers processes) and the
+ * asynchronous archive lookup decision (which has to wait for input channels
+ * to drain).
+ *
+ * <p>{@link #knownChecksums} is a per-run registry used by
+ * {@link StageTake#computeFileChecksum} for the source-deletion fallback —
+ * populated lazily by scanning historical archives of the same stage when a
+ * declared input path is no longer readable.
  */
 @Slf4j
 @CompileStatic
@@ -59,6 +64,7 @@ class StageCache {
     private StageArchive archive0
     private Path cachedStagesTsv
     private volatile boolean headerWritten
+    private final ConcurrentHashMap<Path, String> knownChecksums = new ConcurrentHashMap<>()
 
     /** Reset state (for tests). */
     synchronized void reset() {
@@ -67,6 +73,7 @@ class StageCache {
         archive0 = null
         cachedStagesTsv = null
         headerWritten = false
+        knownChecksums.clear()
     }
 
     /** @return whether stage cache is configured (archiveRoot set). */
@@ -98,9 +105,9 @@ class StageCache {
         if( !config0?.enabled )
             return proceed.call()
 
-        // clone channel inputs in-place; static inputs feed straight into the digest
+        // clone channel inputs in-place; the `inputs` snapshot retains the
+        // *original* value for static entries so StageTake.build can serialize them
         final clonedChannels = new LinkedHashMap<String, ClonedChannel>()
-        final staticInputs = new LinkedHashMap<String, Object>()
 
         for( final inputName : new ArrayList<String>(inputs.keySet()) ) {
             final value = inputs.get(inputName)
@@ -110,24 +117,19 @@ class StageCache {
                 clonedChannels.put(inputName, new ClonedChannel(inputName, value, clone, isValue))
                 inputs.put(inputName, clone)
             }
-            else {
-                staticInputs.put(inputName, value)
-            }
         }
-
-        final staticDigest = StageDigest.computeStatic(workflow.name, staticInputs)
 
         // proceed registers processes wired onto the clones (which are still empty)
         final realOutput = proceed.call() as ChannelOut
         final placeholders = buildPlaceholders(realOutput)
 
         if( clonedChannels.isEmpty() ) {
-            // no channel inputs → digest already known, decide immediately
-            final digest = StageDigest.computeFinal(staticDigest, Collections.<String, List<Object>> emptyMap())
-            decide(workflow.name, digest, realOutput, placeholders, clonedChannels, null)
+            // pure-static stage: compute take immediately
+            final take = StageTake.build(workflow.name, inputs, null, null, archive0, knownChecksums)
+            decide(workflow.name, take, realOutput, placeholders, clonedChannels, null)
         }
         else {
-            subscribeAndCollect(workflow.name, staticDigest, realOutput, placeholders, clonedChannels)
+            subscribeAndCollect(workflow.name, inputs, realOutput, placeholders, clonedChannels)
         }
 
         return new ChannelOut(placeholders)
@@ -151,20 +153,17 @@ class StageCache {
         initialized = true
     }
 
-    private static final String TSV_HEADER = "stage\tdigest\ttask_count\tarchive_path\tarchived_at\tmode\n"
+    private static final String TSV_HEADER = "stage\tdigest\tarchive_path\tarchived_at\n"
 
-    private synchronized void appendCachedStageEntry(Map cached, String mode) {
+    private synchronized void appendCachedStageEntry(String stageName, String archiveDirName, Map cached) {
         if( cachedStagesTsv == null ) return
-        final stage = cached.get('stage') as String
-        final digest = cached.get('content_digest') as String
         final archivedAt = cached.get('created_at') as String
-        final archivePath = archive0.archivePath(stage, digest)
-        // task_count is 0 until task-hash back-fill lands (M3+)
+        final archivePath = archive0.archivePath(stageName, archiveDirName)
         if( !headerWritten ) {
             Files.write(cachedStagesTsv, TSV_HEADER.getBytes('UTF-8'))
             headerWritten = true
         }
-        final line = "${stage}\t${digest}\t0\t${archivePath}\t${archivedAt}\t${mode}\n"
+        final line = "${stageName}\t${archiveDirName}\t${archivePath}\t${archivedAt}\n"
         Files.write(cachedStagesTsv, line.getBytes('UTF-8'), StandardOpenOption.APPEND)
     }
 
@@ -179,27 +178,29 @@ class StageCache {
 
     /**
      * Subscribe once per original channel; accumulate emissions; when all complete,
-     * compute the final digest and dispatch the hit/miss decision.
+     * build the take and dispatch the hit/miss decision.
      */
     private void subscribeAndCollect(String stageName,
-                                     String staticDigest,
+                                     Map<String, Object> declaredInputs,
                                      ChannelOut realOutput,
                                      Map<String, DataflowWriteChannel> placeholders,
                                      Map<String, ClonedChannel> clonedChannels) {
         final collected = new LinkedHashMap<String, List<Object>>()
+        final isValueMap = new LinkedHashMap<String, Boolean>()
         final pending = new AtomicInteger(clonedChannels.size())
 
         for( final cc : clonedChannels.values() ) {
             final String capturedName = cc.inputName
             collected.put(capturedName, Collections.synchronizedList(new ArrayList<Object>()))
+            isValueMap.put(capturedName, cc.isValue)
             DataflowHelper.subscribeImpl(CH.getReadChannel(cc.original), [
                 onNext: { Object value ->
                     collected.get(capturedName).add(value)
                 } as Closure,
                 onComplete: {
                     if( pending.decrementAndGet() == 0 ) {
-                        final digest = StageDigest.computeFinal(staticDigest, collected)
-                        decide(stageName, digest, realOutput, placeholders, clonedChannels, collected)
+                        final take = StageTake.build(stageName, declaredInputs, collected, isValueMap, archive0, knownChecksums)
+                        decide(stageName, take, realOutput, placeholders, clonedChannels, collected)
                     }
                 } as Closure
             ] as Map<String, Closure>)
@@ -207,25 +208,26 @@ class StageCache {
     }
 
     private void decide(String stageName,
-                        String digest,
+                        StageTake take,
                         ChannelOut realOutput,
                         Map<String, DataflowWriteChannel> placeholders,
                         Map<String, ClonedChannel> clonedChannels,
                         Map<String, List<Object>> collected) {
         try {
-            final cached = archive0.findArchive(stageName, digest)
+            final archiveDirName = take.archiveDirName()
+            final cached = archive0.findArchive(stageName, archiveDirName)
             if( cached != null ) {
-                log.info "Reusing archived stage ${stageName} (${digest})"
-                emitArchive(cached, placeholders)
+                log.info "Reusing archived stage ${stageName} (${archiveDirName})"
+                emitArchive(stageName, archiveDirName, cached, placeholders)
                 stopClones(clonedChannels)
-                appendCachedStageEntry(cached, 'reuse')
+                appendCachedStageEntry(stageName, archiveDirName, cached)
                 return
             }
 
-            log.info "Executing stage ${stageName} (no archive for ${digest})"
+            log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
             feedClones(clonedChannels, collected)
             if( config0.writable ) {
-                archive0.archiveWithForward(stageName, digest, realOutput, placeholders)
+                archive0.archiveWithForward(stageName, take, realOutput, placeholders)
             }
             else {
                 forwardOutputs(realOutput, placeholders)
@@ -264,10 +266,11 @@ class StageCache {
         }
     }
 
-    private void emitArchive(Map cached, Map<String, DataflowWriteChannel> placeholders) {
-        final stageName = cached.get('stage') as String
-        final contentDigest = cached.get('content_digest') as String
-        final basePath = archive0.archivePath(stageName, contentDigest)
+    private void emitArchive(String stageName,
+                             String archiveDirName,
+                             Map cached,
+                             Map<String, DataflowWriteChannel> placeholders) {
+        final basePath = archive0.archivePath(stageName, archiveDirName)
         final emitMap = cached.get('emit') as Map<String, Map>
 
         for( final entry : emitMap.entrySet() ) {

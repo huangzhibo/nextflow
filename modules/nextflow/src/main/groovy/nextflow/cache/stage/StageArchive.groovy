@@ -16,12 +16,13 @@
 package nextflow.cache.stage
 
 import java.nio.file.Files
-import java.nio.file.NoSuchFileException
 import java.nio.file.Path
+import java.nio.file.Paths
 import java.nio.file.StandardCopyOption
 import java.security.DigestInputStream
 import java.security.MessageDigest
 import java.time.OffsetDateTime
+import java.util.concurrent.ConcurrentMap
 import java.util.concurrent.atomic.AtomicInteger
 
 import groovy.json.JsonOutput
@@ -42,8 +43,8 @@ import nextflow.script.ChannelOut
  * <pre>
  *   archiveRoot/
  *     STAGE_NAME/
- *       &lt;digest-prefix-16&gt;/
- *         stage.json                    metadata + serialized channel data
+ *       &lt;archiveDirName, 16-hex&gt;/
+ *         stage.json                    metadata + take + emit
  *         0/                            files for emission 0 (if any)
  *           foo.bam
  *         1/                            ...
@@ -54,19 +55,23 @@ import nextflow.script.ChannelOut
  * {
  *   "schema_version": "v1",
  *   "stage": "ALIGN",
- *   "content_digest": "sha256:...",
  *   "created_at": "2026-05-11T...",
+ *   "take": { ... see StageTake },
  *   "emit": {
  *     "bam": {
  *       "type": "queue",
  *       "items": [
- *         [ { "type":"value", "data":{...} }, { "type":"file", "name":"x.bam", "checksum":"sha256:...", "size":N } ],
+ *         [ { "type":"value", "data":{...} },
+ *           { "type":"file", "name":"x.bam", "checksum":"sha256:...", "size":N } ],
  *         ...
  *       ]
  *     }
  *   }
  * }
  * </pre>
+ *
+ * <p>The archive directory name IS the digest (16-char hex over the canonical
+ * take), so no separate {@code content_digest} field is stored.
  *
  * <p>Archive completeness is implied by the presence of {@code stage.json}:
  * {@link #writeArchive} writes every per-emission file directory <em>before</em>
@@ -78,7 +83,6 @@ import nextflow.script.ChannelOut
 class StageArchive {
 
     static final String SCHEMA_VERSION = 'v1'
-    static final int DIGEST_PREFIX_LEN = 16
 
     private final Path archiveRoot
 
@@ -88,19 +92,17 @@ class StageArchive {
 
     Path getArchiveRoot() { archiveRoot }
 
-    Path archivePath(String stageName, String digest) {
-        final raw = digest.startsWith(StageDigest.PREFIX) ? digest.substring(StageDigest.PREFIX.length()) : digest
-        final prefix = raw.length() > DIGEST_PREFIX_LEN ? raw.substring(0, DIGEST_PREFIX_LEN) : raw
-        return archiveRoot.resolve(stageName).resolve(prefix)
+    Path archivePath(String stageName, String archiveDirName) {
+        return archiveRoot.resolve(stageName).resolve(archiveDirName)
     }
 
     /**
      * @return the parsed {@code stage.json} when an archive exists for the
-     *         given stage + content digest; null on absence or on a corrupted
-     *         file (warnings logged for the corrupted case).
+     *         given stage + archive directory name; null on absence or on a
+     *         corrupted file (warnings logged for the corrupted case).
      */
-    Map findArchive(String stageName, String contentDigest) {
-        final stageJson = archivePath(stageName, contentDigest).resolve('stage.json')
+    Map findArchive(String stageName, String archiveDirName) {
+        final stageJson = archivePath(stageName, archiveDirName).resolve('stage.json')
         if( !Files.isRegularFile(stageJson) )
             return null
         try {
@@ -124,15 +126,46 @@ class StageArchive {
     }
 
     /**
+     * Walk every {@code stage.json} under {@code archiveRoot/stageName/*},
+     * populating {@code knownChecksums} via putIfAbsent from the {@code take}
+     * field's file elements (path → checksum).
+     *
+     * <p>Each archive is parsed under its own try/catch — a corrupt
+     * {@code stage.json} is logged and skipped, never aborting the scan.
+     */
+    void scanThisStageArchives(String stageName, ConcurrentMap<Path, String> knownChecksums) {
+        final stageDir = archiveRoot.resolve(stageName)
+        if( !Files.isDirectory(stageDir) )
+            return
+        Files.newDirectoryStream(stageDir).withCloseable { stream ->
+            for( final archiveDir : stream ) {
+                final stageJson = archiveDir.resolve('stage.json')
+                if( !Files.isRegularFile(stageJson) )
+                    continue
+                try {
+                    final data = new JsonSlurper().parse(stageJson.toFile()) as Map
+                    final take = data.get('take') as Map<String, Map>
+                    if( take == null )
+                        continue
+                    walkTakeFiles(take, knownChecksums)
+                }
+                catch( Exception e ) {
+                    log.warn "Skipping corrupt archive ${stageJson}: ${e.message}"
+                }
+            }
+        }
+    }
+
+    /**
      * Subscribe once to {@code output}, forwarding each emission to the matching
      * placeholder AND collecting it for archiving. Single subscription avoids
      * the "double consume" problem on {@link groovyx.gpars.dataflow.DataflowQueue}.
      *
      * When all queue channels have completed, persists {@code stage.json} and
-     * the per-emission file directories under {@link #archivePath(String, String)}.
+     * the per-emission file directories under the take-derived archive dir.
      */
     void archiveWithForward(String stageName,
-                            String contentDigest,
+                            StageTake take,
                             ChannelOut output,
                             Map<String, DataflowWriteChannel> placeholders) {
         final names = output.getNames()
@@ -159,7 +192,7 @@ class StageArchive {
         }
 
         if( queueCount == 0 ) {
-            writeArchive(stageName, contentDigest, collected, channelTypes)
+            writeArchive(stageName, take, collected, channelTypes)
             return
         }
 
@@ -179,7 +212,7 @@ class StageArchive {
                 onComplete: {
                     if( capturedDst != null ) capturedDst.bind(Channel.STOP)
                     if( pending.decrementAndGet() == 0 )
-                        writeArchive(stageName, contentDigest, collected, channelTypes)
+                        writeArchive(stageName, take, collected, channelTypes)
                 } as Closure
             ] as Map<String, Closure>)
         }
@@ -188,10 +221,11 @@ class StageArchive {
     // -- private --
 
     private void writeArchive(String stageName,
-                              String contentDigest,
+                              StageTake take,
                               Map<String, List<Object>> collected,
                               Map<String, String> channelTypes) {
-        final path = archivePath(stageName, contentDigest)
+        final archiveDirName = take.archiveDirName()
+        final path = archivePath(stageName, archiveDirName)
         // single-writer arbitration: first writer wins, subsequent writers no-op
         if( Files.exists(path.resolve('stage.json')) ) {
             log.debug "Stage ${stageName} archive already exists at ${path}, skipping write"
@@ -215,8 +249,8 @@ class StageArchive {
         final stageData = [
             schema_version: SCHEMA_VERSION,
             stage         : stageName,
-            content_digest: contentDigest,
             created_at    : OffsetDateTime.now().toString(),
+            take          : take.toStorageMap(),
             emit          : emitJson,
         ]
         // stage.json is the commit marker: write it last so any presence-on-disk
@@ -224,6 +258,27 @@ class StageArchive {
         final json = JsonOutput.prettyPrint(JsonOutput.toJson(stageData))
         Files.write(path.resolve('stage.json'), json.getBytes('UTF-8'))
         log.info "Stage ${stageName} archived to ${path}"
+    }
+
+    private static void walkTakeFiles(Map<String, Map> take, ConcurrentMap<Path, String> knownChecksums) {
+        for( final entry : take.entrySet() ) {
+            final items = (entry.value as Map).get('items') as List<List>
+            if( items == null ) continue
+            for( final row : items ) {
+                if( row == null ) continue
+                for( final el : row ) {
+                    final m = el as Map
+                    if( m == null || m.get('type') != 'file' ) continue
+                    final pathStr = m.get('path') as String
+                    final checksum = m.get('checksum') as String
+                    if( pathStr == null || checksum == null ) continue
+                    final canonical = Paths.get(pathStr).toAbsolutePath().normalize()
+                    final prev = knownChecksums.putIfAbsent(canonical, checksum)
+                    if( prev != null && prev != checksum )
+                        log.warn "Conflicting checksums for ${canonical}: keeping ${prev}, ignoring ${checksum}"
+                }
+            }
+        }
     }
 
     private static List<Map> serializeValue(Object value, Path itemDir) {
@@ -260,6 +315,6 @@ class StageArchive {
         source.withInputStream { raw ->
             Files.copy(new DigestInputStream(raw, digest), target, StandardCopyOption.REPLACE_EXISTING)
         }
-        return StageDigest.PREFIX + digest.digest().encodeHex().toString()
+        return StageTake.SHA256_PREFIX + digest.digest().encodeHex().toString()
     }
 }

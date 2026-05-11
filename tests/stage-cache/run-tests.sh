@@ -23,7 +23,8 @@ TEST_ID=""
 cleanup() {
     rm -rf ".nextflow" "work-${TEST_ID}" ".nf-stage-archive-${TEST_ID}" \
            "cached-stages-${TEST_ID}.tsv" ".stage-test-${TEST_ID}.config" \
-           ".stage-noplugin-${TEST_ID}.config" 2>/dev/null || true
+           ".stage-noplugin-${TEST_ID}.config" \
+           "sandbox-${TEST_ID}-a" "sandbox-${TEST_ID}-b" 2>/dev/null || true
 }
 
 assert_completed() {
@@ -331,6 +332,56 @@ test_many_samples() {
 # written by users and there's nothing for us to test here.
 
 # ------------------------------------------------------------------
+# Test: source-deleted recovery (3-step fallback step 3 → archive scan)
+# Files vanish between runs; digest must still be recoverable from the
+# stage's own prior archive (which recorded path → checksum in `take`).
+# ------------------------------------------------------------------
+test_source_deleted() {
+    local cfg; cfg=$(test_config)
+    local sandbox="sandbox-${TEST_ID}-a"
+    mkdir -p "$sandbox"
+    cp data/sample1.fq data/sample2.fq "$sandbox/"
+
+    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
+        --input_dir "$sandbox" > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+
+    between_runs
+    rm -f "$sandbox/sample1.fq" "$sandbox/sample2.fq"
+
+    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
+        --input_dir "$sandbox" > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 0
+    assert_cached_stages 2
+    rm -f "$cfg"
+}
+
+# ------------------------------------------------------------------
+# Test: cross-cluster portability (path excluded from hash)
+# Files relocated to a different absolute path between runs but content
+# and filename unchanged; digest must match across the two locations.
+# ------------------------------------------------------------------
+test_cross_cluster() {
+    local cfg; cfg=$(test_config)
+    local sandbox_a="sandbox-${TEST_ID}-a"
+    local sandbox_b="sandbox-${TEST_ID}-b"
+    mkdir -p "$sandbox_a" "$sandbox_b"
+    cp data/sample1.fq data/sample2.fq "$sandbox_a/"
+    cp data/sample1.fq data/sample2.fq "$sandbox_b/"
+
+    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
+        --input_dir "$sandbox_a" > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+
+    between_runs
+    $NXF run test-relocate.nf -c "$cfg" -work-dir "work-${TEST_ID}" \
+        --input_dir "$sandbox_b" > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 0
+    assert_cached_stages 2
+    rm -f "$cfg"
+}
+
+# ------------------------------------------------------------------
 # Run tests
 # ------------------------------------------------------------------
 declare -a ALL_TESTS=(
@@ -346,6 +397,8 @@ declare -a ALL_TESTS=(
     "untracked-process  test_untracked_process"
     "nested-workflow    test_nested_workflow"
     "many-samples       test_many_samples"
+    "source-deleted     test_source_deleted"
+    "cross-cluster      test_cross_cluster"
 )
 
 if [[ $# -eq 1 ]]; then

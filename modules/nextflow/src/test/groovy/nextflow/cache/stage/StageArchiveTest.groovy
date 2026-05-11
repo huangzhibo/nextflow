@@ -17,7 +17,9 @@ package nextflow.cache.stage
 
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.ConcurrentHashMap
 
+import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import nextflow.Channel
 import nextflow.extension.CH
@@ -36,136 +38,93 @@ class StageArchiveTest extends Specification {
         archive = new StageArchive(tempDir)
     }
 
+    private static StageTake takeFor(String label) {
+        // hand-craft a take whose archiveDirName depends on `label` so different
+        // tests don't collide on archive directory
+        return new StageTake([
+            'k': [type: 'value', items: [[[type: 'value', data: label]]]] as Map
+        ])
+    }
+
     // -- archivePath --
 
-    @spock.lang.Unroll
-    def 'archivePath strips sha256: prefix and uses first 16 hex chars'() {
+    def 'archivePath joins root + stage + dir name verbatim'() {
         expect:
-        archive.archivePath(STAGE, DIGEST) == tempDir.resolve(EXPECTED)
-
-        where:
-        STAGE   | DIGEST                          | EXPECTED
-        'ALIGN' | 'sha256:abcdef1234567890aaaa'   | 'ALIGN/abcdef1234567890'
-        'STAGE' | 'sha256:1234567890abcdef1111'   | 'STAGE/1234567890abcdef'
-        'STAGE' | 'sha256:abc'                    | 'STAGE/abc'                 // short digest: no truncation
+        archive.archivePath('ALIGN', 'abcdef1234567890') == tempDir.resolve('ALIGN/abcdef1234567890')
     }
 
     // -- findArchive --
 
-    def 'findArchive should return null when no archive exists'() {
+    def 'findArchive returns null when no archive exists'() {
         expect:
-        archive.findArchive('ALIGN', 'sha256:abcdef1234567890aaaa') == null
+        archive.findArchive('ALIGN', 'abcdef1234567890') == null
     }
 
-    def 'findArchive should return data when stage.json exists'() {
+    def 'findArchive returns parsed stage.json'() {
         given:
-        def p = archive.archivePath('ALIGN', 'sha256:abcdef1234567890aaaa')
+        def p = archive.archivePath('ALIGN', 'abcdef1234567890')
         Files.createDirectories(p)
         Files.write(p.resolve('stage.json'),
-            '{"stage":"ALIGN","content_digest":"sha256:abcdef1234567890aaaa"}'.getBytes())
-
+            '{"stage":"ALIGN","schema_version":"v1"}'.getBytes())
         when:
-        def result = archive.findArchive('ALIGN', 'sha256:abcdef1234567890aaaa')
-
+        def result = archive.findArchive('ALIGN', 'abcdef1234567890')
         then:
         result != null
         result.stage == 'ALIGN'
-        result.content_digest == 'sha256:abcdef1234567890aaaa'
+        result.schema_version == 'v1'
     }
 
-    def 'findArchive should return null on malformed JSON'() {
+    def 'findArchive returns null on malformed JSON'() {
         given:
-        def p = archive.archivePath('ALIGN', 'sha256:abcdef1234567890aaaa')
+        def p = archive.archivePath('ALIGN', 'abcdef1234567890')
         Files.createDirectories(p)
         Files.write(p.resolve('stage.json'), 'not json'.getBytes())
-
         expect:
-        archive.findArchive('ALIGN', 'sha256:abcdef1234567890aaaa') == null
+        archive.findArchive('ALIGN', 'abcdef1234567890') == null
     }
 
-    // -- serializeValue / rebuildValue round-trip --
+    // -- rebuildValue round-trip --
 
-    def 'serialize+rebuild scalar'() {
+    def 'rebuild scalar value'() {
         given:
-        def itemDir = tempDir.resolve('items/0')
-
-        when:
-        def serialized = StageArchive.metaClass.invokeStaticMethod(StageArchive, 'serializeValue', [42, itemDir] as Object[]) as List<Map>
-        then:
-        serialized[0].type == 'value'
-        serialized[0].data == 42
-
-        when:
-        def rebuilt = StageArchive.rebuildValue(serialized, itemDir)
-        then:
-        rebuilt == 42
+        def itemDir = tempDir.resolve('x')
+        expect:
+        StageArchive.rebuildValue([[type: 'value', data: 42] as Map], itemDir) == 42
     }
 
-    def 'serialize+rebuild map'() {
+    def 'rebuild map value'() {
         given:
+        def itemDir = tempDir.resolve('x')
         def meta = [id: 'S1', type: 'WGS']
-        def itemDir = tempDir.resolve('items/0')
-
-        when:
-        def serialized = StageArchive.metaClass.invokeStaticMethod(StageArchive, 'serializeValue', [meta, itemDir] as Object[]) as List<Map>
-        then:
-        serialized[0].type == 'value'
-        serialized[0].data == meta
-
-        when:
-        def rebuilt = StageArchive.rebuildValue(serialized, itemDir)
-        then:
-        rebuilt == meta
+        expect:
+        StageArchive.rebuildValue([[type: 'value', data: meta] as Map], itemDir) == meta
     }
 
-    def 'serialize+rebuild single Path with content + checksum'() {
+    def 'rebuild single file element resolves under itemDir'() {
         given:
-        def src = tempDir.resolve('src/test.bam')
-        Files.createDirectories(src.parent)
-        Files.write(src, 'bam content'.getBytes())
         def itemDir = tempDir.resolve('items/0')
-
+        Files.createDirectories(itemDir)
         when:
-        def serialized = StageArchive.metaClass.invokeStaticMethod(StageArchive, 'serializeValue', [src, itemDir] as Object[]) as List<Map>
-        then:
-        serialized.size() == 1
-        serialized[0].type == 'file'
-        serialized[0].name == 'test.bam'
-        serialized[0].checksum.startsWith('sha256:')
-        serialized[0].size == 11
-        Files.exists(itemDir.resolve('test.bam'))
-
-        when:
-        def rebuilt = StageArchive.rebuildValue(serialized, itemDir) as Path
+        def rebuilt = StageArchive.rebuildValue(
+            [[type: 'file', name: 'test.bam'] as Map], itemDir) as Path
         then:
         rebuilt.fileName.toString() == 'test.bam'
-        Files.readString(rebuilt) == 'bam content'
+        rebuilt.parent == itemDir
     }
 
-    def 'serialize+rebuild tuple [meta, file1, file2]'() {
+    def 'rebuild tuple [meta, file]'() {
         given:
-        def srcDir = tempDir.resolve('src')
-        Files.createDirectories(srcDir)
-        Files.write(srcDir.resolve('S1.bam'), 'bam'.getBytes())
-        Files.write(srcDir.resolve('S1.bai'), 'idx'.getBytes())
         def itemDir = tempDir.resolve('items/0')
-        def tuple = [[id: 'S1'], srcDir.resolve('S1.bam'), srcDir.resolve('S1.bai')]
-
+        Files.createDirectories(itemDir)
         when:
-        def serialized = StageArchive.metaClass.invokeStaticMethod(StageArchive, 'serializeValue', [tuple, itemDir] as Object[]) as List<Map>
+        def rebuilt = StageArchive.rebuildValue([
+            [type: 'value', data: [id: 'S1']] as Map,
+            [type: 'file',  name: 'S1.bam'] as Map,
+        ], itemDir) as List
         then:
-        serialized.size() == 3
-        serialized[0].type == 'value'
-        serialized[1].type == 'file'
-        serialized[2].type == 'file'
-
-        when:
-        def rebuilt = StageArchive.rebuildValue(serialized, itemDir) as List
-        then:
-        rebuilt.size() == 3
+        rebuilt.size() == 2
         rebuilt[0] == [id: 'S1']
         (rebuilt[1] as Path).fileName.toString() == 'S1.bam'
-        Files.readString(rebuilt[1] as Path) == 'bam'
     }
 
     // -- copyWithChecksum --
@@ -174,11 +133,9 @@ class StageArchiveTest extends Specification {
         given:
         def src = tempDir.resolve('src.txt')
         Files.write(src, 'hello'.getBytes())
-
         when:
         def c1 = StageArchive.copyWithChecksum(src, tempDir.resolve('a.txt'))
         def c2 = StageArchive.copyWithChecksum(src, tempDir.resolve('b.txt'))
-
         then:
         c1.startsWith('sha256:')
         c1 == c2
@@ -187,8 +144,9 @@ class StageArchiveTest extends Specification {
 
     // -- archiveWithForward end-to-end --
 
-    def 'archiveWithForward writes stage.json with v1 schema for value-channel-only output'() {
+    def 'archiveWithForward writes v1 stage.json with take + emit; no content_digest'() {
         given:
+        def take = takeFor('value-only')
         def valueCh = CH.create(true)
         def output = new ChannelOut(out: valueCh as groovyx.gpars.dataflow.DataflowWriteChannel)
         valueCh.bind('hello')
@@ -197,18 +155,22 @@ class StageArchiveTest extends Specification {
         def placeholders = ['out': placeholderOut] as Map<String, groovyx.gpars.dataflow.DataflowWriteChannel>
 
         when:
-        archive.archiveWithForward('STAGE', 'sha256:abcdef1234567890zzzz', output, placeholders)
+        archive.archiveWithForward('STAGE', take, output, placeholders)
         then:
-        def stageJson = archive.archivePath('STAGE', 'sha256:abcdef1234567890zzzz').resolve('stage.json')
+        def stageDir = archive.archivePath('STAGE', take.archiveDirName())
+        def stageJson = stageDir.resolve('stage.json')
         Files.exists(stageJson)
         def data = new JsonSlurper().parse(stageJson.toFile()) as Map
         data.schema_version == 'v1'
         data.stage == 'STAGE'
-        data.content_digest == 'sha256:abcdef1234567890zzzz'
-        !data.containsKey('integrity')                            // dropped from v1
+        !data.containsKey('content_digest')
+        !data.containsKey('integrity')
+        and: 'take is stored'
+        data.take != null
+        data.take.k.items[0][0].data == 'value-only'
+        and: 'emit is stored'
         data.emit.out.type == 'value'
         data.emit.out.items.size() == 1
-        data.emit.out.items[0][0].type == 'value'
         data.emit.out.items[0][0].data == 'hello'
         and: 'placeholder receives the forwarded value'
         placeholderOut.val == 'hello'
@@ -218,6 +180,7 @@ class StageArchiveTest extends Specification {
         // regression: a loop-variable capture bug previously routed all
         // async onNext callbacks to the same `collected[name]` bucket
         given:
+        def take = takeFor('mixed')
         def valueCh = CH.create(true)
         valueCh.bind(100)
         def queueCh = CH.create(false)
@@ -232,16 +195,16 @@ class StageArchiveTest extends Specification {
         ] as Map<String, groovyx.gpars.dataflow.DataflowWriteChannel>
 
         when:
-        archive.archiveWithForward('STAGE', 'sha256:abcdef1234567890mixd', output, placeholders)
+        archive.archiveWithForward('STAGE', take, output, placeholders)
         and: 'queue produces 2 emissions then completes'
         queueCh.bind([id: 'S1'])
         queueCh.bind([id: 'S2'])
-        queueCh.bind(nextflow.Channel.STOP)
+        queueCh.bind(Channel.STOP)
         // give async subscription a moment
         Thread.sleep(200)
 
         then:
-        def stageJson = archive.archivePath('STAGE', 'sha256:abcdef1234567890mixd').resolve('stage.json')
+        def stageJson = archive.archivePath('STAGE', take.archiveDirName()).resolve('stage.json')
         Files.exists(stageJson)
         def data = new JsonSlurper().parse(stageJson.toFile()) as Map
         and: 'total stays a value channel with exactly 1 item = 100'
@@ -255,9 +218,10 @@ class StageArchiveTest extends Specification {
         data.emit.counts.items[1][0].data == [id: 'S2']
     }
 
-    def 'archiveWithForward should no-op when archive already exists'() {
+    def 'archiveWithForward no-ops when archive already exists (first writer wins)'() {
         given:
-        def p = archive.archivePath('STAGE', 'sha256:abcdef1234567890zzzz')
+        def take = takeFor('exists')
+        def p = archive.archivePath('STAGE', take.archiveDirName())
         Files.createDirectories(p)
         Files.write(p.resolve('stage.json'), '{"original":"keep"}'.getBytes())
         and:
@@ -267,9 +231,92 @@ class StageArchiveTest extends Specification {
         def placeholders = ['out': CH.create(true)] as Map<String, groovyx.gpars.dataflow.DataflowWriteChannel>
 
         when:
-        archive.archiveWithForward('STAGE', 'sha256:abcdef1234567890zzzz', output, placeholders)
-        then: 'existing stage.json is preserved (first writer wins)'
+        archive.archiveWithForward('STAGE', take, output, placeholders)
+        then: 'existing stage.json is preserved'
         def data = new JsonSlurper().parse(p.resolve('stage.json').toFile()) as Map
         data.original == 'keep'
+    }
+
+    // -- scanThisStageArchives --
+
+    def 'scanThisStageArchives populates knownChecksums from take.file elements'() {
+        given:
+        def known = new ConcurrentHashMap<Path, String>()
+        def stageDir = tempDir.resolve('STAGE').resolve('aaaa111122223333')
+        Files.createDirectories(stageDir)
+        def take = new StageTake([
+            reads: [type: 'queue', items: [[
+                [type: 'file', name: 'a.fq', path: '/data/a.fq', checksum: 'sha256:aaa']
+            ], [
+                [type: 'file', name: 'b.fq', path: '/data/b.fq', checksum: 'sha256:bbb']
+            ]]] as Map
+        ])
+        Files.write(stageDir.resolve('stage.json'),
+            JsonOutput.toJson([schema_version: 'v1', stage: 'STAGE',
+                               take: take.toStorageMap(), emit: [:]]).getBytes('UTF-8'))
+
+        when:
+        archive.scanThisStageArchives('STAGE', known)
+        then:
+        known.size() == 2
+        known.get(java.nio.file.Paths.get('/data/a.fq').toAbsolutePath().normalize()) == 'sha256:aaa'
+        known.get(java.nio.file.Paths.get('/data/b.fq').toAbsolutePath().normalize()) == 'sha256:bbb'
+    }
+
+    def 'scanThisStageArchives skips corrupt stage.json without failing the scan'() {
+        given:
+        def known = new ConcurrentHashMap<Path, String>()
+        // good archive
+        def goodDir = tempDir.resolve('STAGE').resolve('aaaa111122223333')
+        Files.createDirectories(goodDir)
+        def take = new StageTake([
+            reads: [type: 'queue', items: [[
+                [type: 'file', name: 'good.fq', path: '/data/good.fq', checksum: 'sha256:good']
+            ]]] as Map
+        ])
+        Files.write(goodDir.resolve('stage.json'),
+            JsonOutput.toJson([take: take.toStorageMap()]).getBytes('UTF-8'))
+        // bad archive
+        def badDir = tempDir.resolve('STAGE').resolve('bbbb222233334444')
+        Files.createDirectories(badDir)
+        Files.write(badDir.resolve('stage.json'), 'not json'.getBytes('UTF-8'))
+
+        when:
+        archive.scanThisStageArchives('STAGE', known)
+        then: 'good archive recorded, scan did not crash'
+        known.size() == 1
+        known.get(java.nio.file.Paths.get('/data/good.fq').toAbsolutePath().normalize()) == 'sha256:good'
+    }
+
+    def 'scanThisStageArchives is a no-op when stage directory does not exist'() {
+        given:
+        def known = new ConcurrentHashMap<Path, String>()
+        when:
+        archive.scanThisStageArchives('NONE', known)
+        then:
+        known.isEmpty()
+        noExceptionThrown()
+    }
+
+    def 'scanThisStageArchives respects putIfAbsent: pre-existing entry wins'() {
+        given:
+        def known = new ConcurrentHashMap<Path, String>()
+        def existing = java.nio.file.Paths.get('/data/x.fq').toAbsolutePath().normalize()
+        known.put(existing, 'sha256:cached')
+        and:
+        def stageDir = tempDir.resolve('STAGE').resolve('aaaa111122223333')
+        Files.createDirectories(stageDir)
+        def take = new StageTake([
+            reads: [type: 'queue', items: [[
+                [type: 'file', name: 'x.fq', path: '/data/x.fq', checksum: 'sha256:from-archive']
+            ]]] as Map
+        ])
+        Files.write(stageDir.resolve('stage.json'),
+            JsonOutput.toJson([take: take.toStorageMap()]).getBytes('UTF-8'))
+
+        when:
+        archive.scanThisStageArchives('STAGE', known)
+        then:
+        known.get(existing) == 'sha256:cached'
     }
 }
