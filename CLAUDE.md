@@ -106,6 +106,26 @@ The project follows a modular architecture with a plugin-based system for cloud 
 - `plugins/*/VERSION`: Define the version of the corresponding plugin sub-project.
 - `adr/`: Architecture Decision Records (ADRs) documenting significant structural and technical decisions in the project
 
+## 设计文档来源（stage-cache 相关）
+
+本 fork 携带内部的 `stage-cache` 能力（named-workflow 级归档与复用），其全部
+项目档案放在 `mydocs/`（gitignored、不进 upstream），不在公开 `adr/` 目录下。
+
+按下列权威次序参考：
+
+1. **当前源码** `modules/nextflow/src/main/groovy/nextflow/cache/stage/`：ground
+   truth；实现走在所有设计文档之前
+2. **`mydocs/`**（gitignored）：本项目的需求文档、设计文档、ADR、流程开发规范
+   等本地档案
+3. **外部 plugin 仓库** `/Users/huangzhibo/workitems/01.github/nf-stage`
+   （`main` / `internal` 分支）：历史 plugin 实现和早期设计稿，比本 fork 实现旧
+4. **`.local-docs/`**（gitignored）：已淘汰 / 不再当作权威来源的内部资料，留作
+   备查；`_archive/` 子目录是更早被淘汰的演化稿
+
+代码和设计文档冲突时，**以代码为准**并主动提示对应文档需要更新。组织内部标识
+符（团队名、内部产品名、内部 URL 等）只放在 `mydocs/` 或 `.local-docs/`，不要
+写进可能 push 到 upstream 的文件（包括 `adr/` 下的公开 ADR）。
+
 ## Release process
 
 Follow these actions to make a new release:
