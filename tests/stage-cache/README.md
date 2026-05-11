@@ -6,7 +6,7 @@ End-to-end test suite for the stage cache feature (see
 ## Running
 
 ```bash
-./run-tests.sh                # all 14 tests
+./run-tests.sh                # all 17 tests
 ./run-tests.sh basic          # one test by short name
 NXF=nextflow ./run-tests.sh   # use system-installed nextflow
 ```
@@ -43,6 +43,9 @@ Each test runs inside an isolated `mktemp -d` directory:
 | `many-samples`       | 10 samples × 2 stages — scale sanity check. |
 | `source-deleted`     | Input files deleted between runs; 3-step fallback recovers via archive scan. |
 | `cross-cluster`      | Same content + name at different absolute paths between runs still hits. |
+| `readonly`           | `stage.writable=false` does not write on miss but still serves hits. |
+| `source-deleted-no-archive` | Source missing AND no archive: 3-step fallback throws and pipeline exits nonzero. |
+| `file-content-change`| Modifying an input file's content between runs invalidates the cache. |
 
 ## Adding a new test
 

@@ -113,6 +113,26 @@ assert_log_contains() {
     fi
 }
 
+# Schema-shape check for an archived stage.json (v1).
+assert_stage_json_v1() {
+    local json=$1
+    if [[ ! -f "$json" ]]; then
+        echo "  ASSERT FAILED: stage.json not found at $json"
+        TEST_FAILED=1
+        return
+    fi
+    grep -q '"schema_version": "v1"' "$json" || {
+        echo "  ASSERT FAILED: schema_version != v1 in $json"; TEST_FAILED=1; }
+    grep -q '"take":'                  "$json" || {
+        echo "  ASSERT FAILED: take field missing in $json"; TEST_FAILED=1; }
+    grep -q '"emit":'                  "$json" || {
+        echo "  ASSERT FAILED: emit field missing in $json"; TEST_FAILED=1; }
+    if grep -q '"content_digest"' "$json"; then
+        echo "  ASSERT FAILED: content_digest must not appear in v1 schema in $json"
+        TEST_FAILED=1
+    fi
+}
+
 # Runner: setup → eval test fn → tear down (or preserve on failure).
 run_test() {
     local name=$1
@@ -142,6 +162,13 @@ test_basic() {
     write_config
     $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 4
+
+    # archive schema check (one per stage is enough)
+    local prep_json align_json
+    prep_json=$(find .nf-stage-archive/PREPARE -name stage.json | head -1)
+    align_json=$(find .nf-stage-archive/ALIGN   -name stage.json | head -1)
+    assert_stage_json_v1 "$prep_json"
+    assert_stage_json_v1 "$align_json"
 
     between_runs
     $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
@@ -323,6 +350,88 @@ test_cross_cluster() {
     assert_cached_stages 2
 }
 
+# Readonly mode: stage.writable=false must (a) not create an archive on
+# miss, (b) still serve hits when the archive exists.
+test_readonly() {
+    cat > readonly.config <<'EOF'
+stage {
+    archiveRoot = '.nf-stage-archive'
+    writable    = false
+}
+workDir = 'work'
+params {
+    reference = 'GRCh38'
+}
+EOF
+    # Phase 1: readonly + no existing archive → runs but does not write.
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c readonly.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+    if [[ -d .nf-stage-archive ]]; then
+        echo "  ASSERT FAILED: archive must not be created when writable=false"
+        TEST_FAILED=1
+    fi
+
+    between_runs
+
+    # Phase 2: switch to writable to pre-populate the archive.
+    write_config
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+
+    between_runs
+
+    # Phase 3: readonly + pre-populated archive → cache hits.
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c readonly.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 0
+}
+
+# 3-step fallback: source files missing AND no historical archive → throw.
+# Pipeline must exit nonzero and log a "does not exist" message.
+test_source_deleted_no_archive() {
+    write_config
+    mkdir empty_sandbox
+    set +e
+    $NXF run "${TESTS_DIR}/test-relocate.nf" -c stage.config \
+        --input_dir "${TEST_DIR}/empty_sandbox" > "$LAST_OUTPUT" 2>&1
+    local rc=$?
+    set -e
+    if [[ $rc -eq 0 ]]; then
+        echo "  ASSERT FAILED: expected nonzero exit when source missing AND no archive"
+        TEST_FAILED=1
+    fi
+    if ! grep -qE 'does not exist|has never been recorded' "$LAST_OUTPUT"; then
+        echo "  ASSERT FAILED: expected 'does not exist' error message"
+        TEST_FAILED=1
+    fi
+}
+
+# Input file content changes between runs → digest changes → stage misses
+# on the changed sample. Cold → warm-hit → modified-miss sequence.
+test_file_content_change() {
+    write_config
+    # Replace the shared-data symlink with a local mutable copy.
+    rm data
+    mkdir data
+    cp "${DATA_DIR}"/sample1.fq "${DATA_DIR}"/sample2.fq data/
+
+    # Cold run.
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+
+    between_runs
+    # Warm run with unchanged content → full hit.
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 0
+    assert_cached_stages 2
+
+    between_runs
+    # Modify content → both stages invalidate (channel emission digest changes,
+    # whole-stage granularity means all 4 tasks re-run).
+    echo "modified" >> data/sample1.fq
+    $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 4
+}
+
 # ----------------------------------------------------------------------
 # Entry
 # ----------------------------------------------------------------------
@@ -342,6 +451,9 @@ declare -a ALL_TESTS=(
     "many-samples       test_many_samples"
     "source-deleted     test_source_deleted"
     "cross-cluster      test_cross_cluster"
+    "readonly           test_readonly"
+    "source-deleted-no-archive  test_source_deleted_no_archive"
+    "file-content-change        test_file_content_change"
 )
 
 if [[ $# -eq 1 ]]; then
