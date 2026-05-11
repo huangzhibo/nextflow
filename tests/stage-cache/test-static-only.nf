@@ -1,10 +1,11 @@
 // Pure-static stage: the named workflow's take is a non-channel value
-// (params.summary_version is a raw String, not wrapped by ChannelOut.spread).
-// Exercises the runStage(...) branch where `clonedChannels.isEmpty()` is true.
+// (params.summary_version is a raw String). Exercises StageCache.runStageStatic.
 //
-// Regression: this branch synchronously called decide() on the main thread,
-// which deadlocked when archiveWithForward used blocking getVal() on a
-// value-channel emit before the workflow body's process had fired.
+// On warm runs, the workflow body itself is never invoked: the digest is
+// computed up front, archive is resolved, and emit placeholders are bound
+// directly to archived values. The inner process therefore reports
+// completed=0 on hit, and cache-hit invocations are observable both as a
+// "Reusing archived stage" log line and a row in cached-stages.tsv.
 
 process EMIT_VERSION_TXT {
     input:

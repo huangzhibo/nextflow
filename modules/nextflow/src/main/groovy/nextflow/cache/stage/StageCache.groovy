@@ -41,14 +41,32 @@ import nextflow.script.WorkflowDef
  * <ol>
  *   <li>{@link WorkflowDef#run0} calls {@link #isEnabled} to gate the hook</li>
  *   <li>If enabled, the hook calls {@link #runStage} with a snapshot of the
- *       workflow's declared inputs (post-{@code ChannelOut.spread}) and a
- *       {@code proceed} closure that runs the workflow body</li>
+ *       workflow's declared inputs (post-{@code ChannelOut.spread}), the
+ *       declared emit names, and a {@code proceed} closure that runs the
+ *       workflow body</li>
  * </ol>
  *
- * <p>The clone-substitute pattern is the only way to defer execution between
- * {@code closure.call()} (which synchronously registers processes) and the
- * asynchronous archive lookup decision (which has to wait for input channels
- * to drain).
+ * <p>Two execution paths based on whether any take slot is a channel:
+ * <ul>
+ *   <li><b>Pure-static</b> (no channel inputs): digest is computable up front.
+ *       On HIT, {@code proceed} is never called — the workflow's processes are
+ *       neither registered nor executed. On MISS, {@code proceed} runs normally;
+ *       archive writing is dispatched to a worker thread because
+ *       {@link StageArchive#archiveWithForward} blocks on {@code getVal()} for
+ *       value-channel emits. See {@link #runStageStatic}.</li>
+ *   <li><b>Has-channel</b>: clone-substitute pattern — channel inputs are
+ *       replaced with empty clones, the body wires processes onto the clones,
+ *       and on first emit (from a worker thread) we decide hit/miss and
+ *       either feed archived data and STOP the clones (gating processes) or
+ *       feed real input through.</li>
+ * </ul>
+ *
+ * <p>Why the main thread can't do blocking emit reads: {@code runStage} is
+ * invoked synchronously from the entry workflow body. The Nextflow task
+ * barrier doesn't dispatch any process until that body returns; blocking on
+ * a value-channel {@code getVal} on the main thread would wait for a process
+ * that can never fire. Worker threads (GPars or subscription callbacks)
+ * sidestep this.
  *
  * <p>{@link #knownChecksums} is a per-run registry used by
  * {@link StageTake#computeFileChecksum} for the source-deletion fallback —
@@ -101,15 +119,17 @@ class StageCache {
      * immediately as the workflow result; the placeholder's channels are
      * filled asynchronously once the cache decision is made.
      */
-    Object runStage(WorkflowDef workflow, Map<String, Object> inputs, Closure proceed) {
+    Object runStage(WorkflowDef workflow,
+                    Map<String, Object> inputs,
+                    List<String> declaredOutputs,
+                    Closure proceed) {
         ensureInit()
         if( !config0?.enabled )
             return proceed.call()
 
-        // clone channel inputs in-place; the `inputs` snapshot retains the
-        // *original* value for static entries so StageTake.build can serialize them
+        // Clone channel inputs in-place; static entries stay as original values
+        // so StageTake.build can serialize them directly.
         final clonedChannels = new LinkedHashMap<String, ClonedChannel>()
-
         for( final inputName : new ArrayList<String>(inputs.keySet()) ) {
             final value = inputs.get(inputName)
             if( CH.isChannel(value) ) {
@@ -120,42 +140,62 @@ class StageCache {
             }
         }
 
-        // proceed registers processes wired onto the clones (which are still empty)
+        // Pure-static: digest computable without waiting for any channel.
+        // Decide before calling proceed so HIT can skip running the body.
+        if( clonedChannels.isEmpty() ) {
+            return runStageStatic(workflow.name, inputs, declaredOutputs, proceed)
+        }
+
+        // Has-channel: clone-trick + async decide on first emit.
         final realOutput = proceed.call() as ChannelOut
         final placeholders = buildPlaceholders(realOutput)
-
-        if( clonedChannels.isEmpty() ) {
-            // Pure-static stage (no channel inputs in `take:`). Two notes:
-            //
-            //   1. Dispatch decide() to a GPars worker thread. archiveWithForward
-            //      uses blocking getVal() on value-channel emits, which would
-            //      deadlock on the main thread — the workflow body has registered
-            //      the process but the task can't fire until the Nextflow barrier
-            //      starts, which can't start until entry workflow returns, which
-            //      can't return until this call does.
-            //
-            //   2. Cache hits *are* recorded and downstream placeholders are
-            //      bound to archived emit, but the workflow's own process is
-            //      not gated. Without channel inputs there is no clone we own —
-            //      Nextflow auto-wraps the raw `take:` value into a channel
-            //      when invoking the process, so by the time decide() resolves
-            //      the hit, the process has already been scheduled. The
-            //      orphaned process output is harmless (no downstream subscribers)
-            //      but its execution cost is paid. Users who care can wrap the
-            //      take value explicitly: WORKFLOW(Channel.value(params.x)).
-            final take = StageTake.build(workflow.name, inputs, null, null, archive0, knownChecksums)
-            Dataflow.task {
-                decide(workflow.name, take, realOutput, placeholders, clonedChannels, null)
-            }
-        }
-        else {
-            subscribeAndCollect(workflow.name, inputs, realOutput, placeholders, clonedChannels)
-        }
-
+        subscribeAndCollect(workflow.name, inputs, realOutput, placeholders, clonedChannels)
         return new ChannelOut(placeholders)
     }
 
     // -- internals --
+
+    private Object runStageStatic(String stageName,
+                                  Map<String, Object> inputs,
+                                  List<String> declaredOutputs,
+                                  Closure proceed) {
+        final take = StageTake.build(stageName, inputs, null, null, archive0, knownChecksums)
+        final archiveDirName = take.archiveDirName()
+        final cached = archive0.findArchive(stageName, archiveDirName)
+
+        if( cached != null ) {
+            try {
+                log.info "Reusing archived stage ${stageName} (${archiveDirName})"
+                final placeholders = buildStaticPlaceholders(declaredOutputs, cached)
+                emitArchive(stageName, archiveDirName, cached, placeholders)
+                stopUnarchivedPlaceholders(placeholders, cached)
+                appendCachedStageEntry(stageName, archiveDirName, cached)
+                return new ChannelOut(placeholders)
+            }
+            catch( Exception e ) {
+                log.error "Stage ${stageName} archive reuse failed, falling back to execution: ${e.message}", e
+            }
+        }
+
+        log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
+        final realOutput = proceed.call() as ChannelOut
+        final placeholders = buildPlaceholders(realOutput)
+        // archiveWithForward blocks on getVal() for value emits; dispatch off the
+        // main thread so the entry-workflow barrier can start and processes can fire.
+        Dataflow.task {
+            try {
+                if( config0.writable )
+                    archive0.archiveWithForward(stageName, take, realOutput, placeholders)
+                else
+                    forwardOutputs(realOutput, placeholders)
+            }
+            catch( Exception e ) {
+                log.error "Stage ${stageName} archive write failed, forwarding without archive: ${e.message}", e
+                forwardOutputs(realOutput, placeholders)
+            }
+        }
+        return new ChannelOut(placeholders)
+    }
 
     private synchronized void ensureInit() {
         if( initialized ) return
@@ -194,6 +234,35 @@ class StageCache {
             result.put(name, CH.create(CH.isValue(ch)))
         }
         return result
+    }
+
+    /**
+     * Build placeholders for a pure-static HIT, keyed by declared emit names.
+     * Channel type (value vs queue) is taken from the archive when available;
+     * declared names missing from the archive default to queue (will be
+     * STOP-terminated by {@link #stopUnarchivedPlaceholders}).
+     */
+    private static Map<String, DataflowWriteChannel> buildStaticPlaceholders(
+            List<String> declaredOutputs, Map cached) {
+        final emitMap = cached.get('emit') as Map<String, Map>
+        final result = new LinkedHashMap<String, DataflowWriteChannel>()
+        for( final name : declaredOutputs ) {
+            final chData = emitMap?.get(name)
+            final isValue = chData != null && chData.get('type') == 'value'
+            result.put(name, CH.create(isValue))
+        }
+        return result
+    }
+
+    /** Bind STOP to queue placeholders that have no corresponding archive emit. */
+    private static void stopUnarchivedPlaceholders(Map<String, DataflowWriteChannel> placeholders,
+                                                   Map cached) {
+        final emitMap = cached.get('emit') as Map<String, Map>
+        for( final entry : placeholders.entrySet() ) {
+            if( !emitMap.containsKey(entry.key) && !CH.isValue(entry.value) ) {
+                entry.value.bind(Channel.STOP)
+            }
+        }
     }
 
     /**
@@ -259,7 +328,7 @@ class StageCache {
             forwardOutputs(realOutput, placeholders)
         }
         finally {
-            collected?.clear()    // release references once feed/stop has fired
+            collected.clear()    // release references once feed/stop has fired
         }
     }
 
@@ -271,10 +340,6 @@ class StageCache {
 
     private static void feedClones(Map<String, ClonedChannel> clonedChannels,
                                    Map<String, List<Object>> collected) {
-        if( collected == null ) {
-            stopClones(clonedChannels)
-            return
-        }
         for( final cc : clonedChannels.values() ) {
             final values = collected.get(cc.inputName)
             if( values != null ) {

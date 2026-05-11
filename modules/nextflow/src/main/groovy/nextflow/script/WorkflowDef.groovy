@@ -225,7 +225,7 @@ class WorkflowDef extends BindableDef implements ChainableDef, IterableDef, Exec
         for( final inputName : declaredInputs ) {
             inputs.put(inputName, binding.getVariable(inputName))
         }
-        final result = StageCache.instance.runStage(this, inputs, {
+        final result = StageCache.instance.runStage(this, inputs, declaredOutputs, {
             for( final entry : inputs.entrySet() ) {
                 binding.setVariable(entry.key, entry.value)
             }

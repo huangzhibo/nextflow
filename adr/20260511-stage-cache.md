@@ -115,6 +115,17 @@ A previous design proposed `strict` mode (refuse to hash if file is gone) and `r
 - `content_digest`: redundant with the archive directory name. Storing the digest twice invites the two values to disagree on disk.
 - `integrity`: redundant with the "stage.json is the commit marker" invariant. Any `stage.json` present implies all referenced files were written, because `writeArchive` writes files first and `stage.json` last under a `Files.exists` first-writer-wins guard.
 
+### Why two execution paths (pure-static fast-path + has-channel clone-trick)
+
+The clone-trick — substitute channel inputs with empty clones, let the body wire processes onto them, then either feed real data or STOP after a hit/miss decision — only works when *every* take slot is a channel we own. For pure-static stages (raw values in `take:`), Nextflow auto-wraps the value into a channel at the inner process call site, which is outside our reach. A unified clone-trick path therefore couldn't gate execution on a hit: the process was scheduled before our async decision resolved, and on top of that, archive writing needed to be dispatched off the main thread to avoid blocking the entry-workflow barrier.
+
+The fix is to recognize that pure-static stages don't need the clone-trick at all: the digest is fully determined by the static inputs, computable before calling the workflow body. `runStageStatic` resolves the archive up front:
+
+- **HIT**: build placeholders from `declaredOutputs`, bind archived data, return — `proceed` is never invoked, so the body's processes are never registered.
+- **MISS**: invoke `proceed` (body runs normally), then dispatch `archiveWithForward` to a GPars worker thread (still blocking on value emits via `getVal`).
+
+Rejected alternative: AST-rewrite raw take values into `Channel.value(x)` so the clone-trick path could handle them uniformly. This would silently break workflow bodies that consume take parameters as plain values (e.g. `if (version == 'v1')` style conditionals), trading one correctness issue for another. The split-path keeps both shapes working in their native idioms.
+
 ### Per-iteration variable capture
 
 Two async subscription loops (in `StageArchive.archiveWithForward` and an earlier iteration of `StageCache.subscribeAndCollect`) suffered from Groovy closures capturing the for-loop variable by reference, routing all `onNext` callbacks to the last iteration's bucket. Fixed by binding `final String capturedName = name` inside each iteration. Worth recording because it is the canonical async-loop trap in Groovy and will be re-introduced by any future code that adds a new per-channel subscription loop. Spock regression covers this in `StageArchiveTest.archiveWithForward correctly routes mixed value + queue channels`.
@@ -130,7 +141,7 @@ Two async subscription loops (in `StageArchive.archiveWithForward` and an earlie
 ```
 modules/nextflow/src/main/groovy/nextflow/cache/stage/
 ├── StageConfig.groovy      # @ScopeName("stage") typed config
-├── StageCache.groovy       # singleton orchestrator + clone-trick
+├── StageCache.groovy       # singleton orchestrator: pure-static fast-path + clone-trick
 ├── StageArchive.groovy     # read/write archive layout + scan
 └── StageTake.groovy        # canonical take + 3-step computeFileChecksum
 

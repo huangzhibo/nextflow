@@ -362,19 +362,21 @@ test_cross_cluster() {
 # So the assertion here is "hit logged", not "process skipped".
 test_static_only() {
     write_config
-    # Phase 1: cold, must complete without deadlocking.
+    # Phase 1: cold, runs the process and archives.
     $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 1
     assert_cached_stages 0
 
     between_runs
-    # Phase 2: warm, same param — cache hit recorded.
+    # Phase 2: warm, same param — pure-static HIT skips the workflow body
+    # entirely, so the process is never registered and completed must be 0.
     $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
+    assert_completed 0
     assert_log_contains "Reusing archived stage VERSION_REPORT"
     assert_cached_stages 1
 
     between_runs
-    # Phase 3: different param, must miss (no hit recorded for this run).
+    # Phase 3: different param, must miss and run again.
     $NXF run "${TESTS_DIR}/test-static-only.nf" -c stage.config --summary_version v9 \
         > "$LAST_OUTPUT" 2>&1 || true
     assert_completed 1

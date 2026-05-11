@@ -58,7 +58,7 @@ class StageCacheTest extends Specification {
         }
         def expected = 'untouched'
         when:
-        def result = StageCache.instance.runStage(null, [:], { expected })
+        def result = StageCache.instance.runStage(null, [:], [], { expected })
         then:
         result == expected
     }
