@@ -290,29 +290,57 @@ class StageCache {
                         Map<String, ClonedChannel> clonedChannels,
                         Map<String, List<Object>> collected) {
         try {
-            final archiveDirName = take.archiveDirName()
-            final cached = archive0.findArchive(stageName, archiveDirName)
-            if( cached != null ) {
-                log.info "Reusing archived stage ${stageName} (${archiveDirName})"
-                emitArchive(stageName, archiveDirName, cached, placeholders)
-                stopClones(clonedChannels)
-                appendCachedStageEntry(stageName, archiveDirName, cached)
+            // -- Stage 1: lookup. placeholders/clones not yet touched, so a
+            //    failure here can safely fall back to normal execution.
+            //    findArchive already swallows JSON corruption (returns null),
+            //    so reaching this catch is unusual.
+            String archiveDirName
+            Map cached
+            try {
+                archiveDirName = take.archiveDirName()
+                cached = archive0.findArchive(stageName, archiveDirName)
+            }
+            catch( Exception e ) {
+                log.error "Stage ${stageName} cache lookup failed, executing without cache: ${e.message}", e
+                feedClones(clonedChannels, collected)
+                forwardOutputs(realOutput, placeholders)
                 return
             }
 
-            log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
-            feedClones(clonedChannels, collected)
-            if( config0.writable ) {
-                archive0.archiveWithForward(stageName, take, realOutput, placeholders)
+            // -- Stage 2: act on the decision. Once placeholders/clones are
+            //    partially driven, re-doing fallback would double-bind. Abort
+            //    the session so the pipeline fails fast instead of producing
+            //    corrupted downstream data.
+            try {
+                if( cached != null ) {
+                    log.info "Reusing archived stage ${stageName} (${archiveDirName})"
+                    emitArchive(stageName, archiveDirName, cached, placeholders)
+                    stopClones(clonedChannels)
+                }
+                else {
+                    log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
+                    feedClones(clonedChannels, collected)
+                    if( config0.writable )
+                        archive0.archiveWithForward(stageName, take, realOutput, placeholders)
+                    else
+                        forwardOutputs(realOutput, placeholders)
+                }
             }
-            else {
-                forwardOutputs(realOutput, placeholders)
+            catch( Exception e ) {
+                log.error "Stage ${stageName} ${cached != null ? 'reuse' : 'execute'} failed mid-operation; aborting session to avoid corrupted output: ${e.message}", e
+                (Global.session as Session)?.abort(e)
+                return
             }
-        }
-        catch( Exception e ) {
-            log.error "Stage ${stageName} archive/reuse failed, falling back to normal execution: ${e.message}", e
-            feedClones(clonedChannels, collected)
-            forwardOutputs(realOutput, placeholders)
+
+            // -- Stage 3: audit tsv. Best-effort; failure here is non-fatal.
+            if( cached != null ) {
+                try {
+                    appendCachedStageEntry(stageName, archiveDirName, cached)
+                }
+                catch( Exception e ) {
+                    log.warn "Stage ${stageName}: failed to write cached-stages report: ${e.message}"
+                }
+            }
         }
         finally {
             collected.clear()    // release references once feed/stop has fired
