@@ -14,12 +14,11 @@ NXF=nextflow ./run-tests.sh   # use system-installed nextflow
 Default `NXF` is `../../launch.sh` (this fork's dev build). Run
 `make compile` once at the repo root before invoking the suite.
 
-Each test runs inside an isolated `mktemp -d` directory:
-
-- **Pass** → temporary directory is removed.
-- **Fail** → temporary directory is preserved and its path is printed,
-  so you can inspect `stage.config`, `.nf-stage-archive/`,
-  `cached-stages.tsv`, the Nextflow log, etc.
+Each test runs inside an isolated `mktemp -d` sandbox; its path is
+printed on both PASS and FAIL so you can `cd` in and inspect
+`stage.config`, `.nf-stage-archive/`, `cached-stages.tsv`,
+`.nextflow.log`, etc. The OS reaps `TMPDIR` on its own
+(~3 days on macOS).
 
 `tests/stage-cache/` itself contains only `.nf` test files, shared
 `data/`, the runner, and this README. Nothing is written here by

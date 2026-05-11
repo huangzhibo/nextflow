@@ -16,6 +16,13 @@
 
 set -uo pipefail
 
+# Force Nextflow's agent-mode log format so each run ends with a
+# `[SUCCESS|FAILED] completed=N failed=N cached=N` line that the
+# `assert_completed` grep can parse. Without this, Nextflow falls back to
+# the ANSI progress bar (no `completed=` field) and every assertion sees
+# an empty value.
+export NXF_AGENT_MODE=1
+
 TESTS_DIR=$(cd "$(dirname "$0")" && pwd)
 NXF=${NXF:-${TESTS_DIR}/../../launch.sh}
 DATA_DIR="${TESTS_DIR}/data"
@@ -133,7 +140,10 @@ assert_stage_json_v1() {
     fi
 }
 
-# Runner: setup → eval test fn → tear down (or preserve on failure).
+# Runner: setup → eval test fn → report.
+# Sandboxes live under `mktemp -d` (TMPDIR) and are reaped by the OS
+# automatically. We always print the path so you can cd in and inspect
+# the archive, stage.json, .nextflow.log, etc.
 run_test() {
     local name=$1
     local fn=$2
@@ -144,11 +154,10 @@ run_test() {
     eval "$fn"
     cd "$TESTS_DIR"
     if [[ $TEST_FAILED -eq 0 ]]; then
-        echo "  PASS"
-        rm -rf "$TEST_DIR"
+        echo "  PASS (${TEST_DIR})"
         ((PASS++))
     else
-        echo "  FAIL (artifacts preserved at ${TEST_DIR})"
+        echo "  FAIL (${TEST_DIR})"
         ((FAIL++))
     fi
 }
