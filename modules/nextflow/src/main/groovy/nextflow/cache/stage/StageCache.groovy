@@ -19,6 +19,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.StandardOpenOption
+import java.time.OffsetDateTime
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -75,6 +76,7 @@ class StageCache {
     private Path cachedStagesTsv
     private volatile boolean headerWritten
     private final ConcurrentHashMap<Path, String> knownChecksums = new ConcurrentHashMap<>()
+    private final ConcurrentHashMap<String, String> archivedStages = new ConcurrentHashMap<>()
 
     /** Reset state (for tests). */
     synchronized void reset() {
@@ -84,7 +86,15 @@ class StageCache {
         cachedStagesTsv = null
         headerWritten = false
         knownChecksums.clear()
+        archivedStages.clear()
     }
+
+    /**
+     * Stage name → archiveDirName for archives produced by this run (MISS path).
+     * Read by {@link StageTaskObserver#onFlowComplete} to locate which
+     * {@code stage.json} files to patch with collected task hashes.
+     */
+    Map<String, String> getArchivedStages() { archivedStages }
 
     /** @return whether stage cache is configured (archiveRoot set). */
     boolean isEnabled() {
@@ -160,7 +170,7 @@ class StageCache {
                 final placeholders = buildStaticPlaceholders(declaredOutputs, cached)
                 emitArchive(stageName, archiveDirName, cached, placeholders)
                 stopUnarchivedPlaceholders(placeholders, cached)
-                appendCachedStageEntry(stageName, archiveDirName, cached)
+                appendCachedStageEntry(stageName, archiveDirName, cached, 'read')
                 return new ChannelOut(placeholders)
             }
             catch( Exception e ) {
@@ -172,13 +182,19 @@ class StageCache {
         final realOutput = proceed.call() as ChannelOut
         final placeholders = buildPlaceholders(realOutput)
         try {
-            if( config0.writable )
+            if( config0.writable ) {
+                archivedStages.put(stageName, archiveDirName)
+                appendCachedStageEntry(stageName, archiveDirName, null, 'wrote')
                 archive0.archiveWithForward(stageName, take, realOutput, placeholders)
-            else
+            }
+            else {
+                appendCachedStageEntry(stageName, archiveDirName, null, 'none')
                 forwardOutputs(realOutput, placeholders)
+            }
         }
         catch( Exception e ) {
             log.error "Stage ${stageName} archive write failed, forwarding without archive: ${e.message}", e
+            archivedStages.remove(stageName)
             forwardOutputs(realOutput, placeholders)
         }
         return new ChannelOut(placeholders)
@@ -194,24 +210,45 @@ class StageCache {
             cachedStagesTsv = launchDir.resolve(config0.cachedStagesFile)
             // each run starts a fresh report — cached-stages.tsv is per-run
             Files.deleteIfExists(cachedStagesTsv)
-            headerWritten = false
             log.debug "Stage cache initialized: archiveRoot=${archive0.archiveRoot}, writable=${config0.writable}, cachedStagesFile=${cachedStagesTsv}"
         }
         initialized = true
     }
 
-    private static final String TSV_HEADER = "stage\tdigest\tarchive_path\tarchived_at\n"
+    private static final String TSV_HEADER = "stage\tdigest\tarchive_path\tarchived_at\tarchive\n"
 
-    private synchronized void appendCachedStageEntry(String stageName, String archiveDirName, Map cached) {
+    /**
+     * Append one row to {@code cached-stages.tsv}, called inline at each stage
+     * decision point.
+     *
+     * <p>{@code cached} is the parsed {@code stage.json} when this is a HIT,
+     * otherwise {@code null}: HIT rows reuse the archive's original
+     * {@code created_at}; MISS rows fall back to {@link OffsetDateTime#now}
+     * (close-but-not-identical to the eventual stage.json {@code created_at}
+     * written asynchronously by {@code archiveWithForward}; for audit purposes
+     * the difference is negligible).
+     *
+     * <p>The {@code task_hashes} count is intentionally not duplicated in this
+     * file — it is available via {@code jq '.task_hashes | length' stage.json}.
+     */
+    private synchronized void appendCachedStageEntry(String stageName,
+                                                    String archiveDirName,
+                                                    Map cached,
+                                                    String archive) {
         if( cachedStagesTsv == null ) return
-        final archivedAt = cached.get('created_at') as String
+        final archivedAt = (cached?.get('created_at') as String) ?: OffsetDateTime.now().toString()
         final archivePath = archive0.archivePath(stageName, archiveDirName)
-        if( !headerWritten ) {
-            Files.write(cachedStagesTsv, TSV_HEADER.getBytes('UTF-8'))
-            headerWritten = true
+        try {
+            if( !headerWritten ) {
+                Files.write(cachedStagesTsv, TSV_HEADER.getBytes('UTF-8'))
+                headerWritten = true
+            }
+            final line = "${stageName}\t${archiveDirName}\t${archivePath}\t${archivedAt}\t${archive}\n"
+            Files.write(cachedStagesTsv, line.getBytes('UTF-8'), StandardOpenOption.APPEND)
         }
-        final line = "${stageName}\t${archiveDirName}\t${archivePath}\t${archivedAt}\n"
-        Files.write(cachedStagesTsv, line.getBytes('UTF-8'), StandardOpenOption.APPEND)
+        catch( Exception e ) {
+            log.warn "Failed to append cached-stages.tsv row for ${stageName} (${archive}): ${e.message}"
+        }
     }
 
     private static Map<String, DataflowWriteChannel> buildPlaceholders(ChannelOut realOutput) {
@@ -316,30 +353,26 @@ class StageCache {
                     log.info "Reusing archived stage ${stageName} (${archiveDirName})"
                     emitArchive(stageName, archiveDirName, cached, placeholders)
                     stopClones(clonedChannels)
+                    appendCachedStageEntry(stageName, archiveDirName, cached, 'read')
                 }
                 else {
                     log.info "Executing stage ${stageName} (no archive for ${archiveDirName})"
                     feedClones(clonedChannels, collected)
-                    if( config0.writable )
+                    if( config0.writable ) {
+                        archivedStages.put(stageName, archiveDirName)
+                        appendCachedStageEntry(stageName, archiveDirName, null, 'wrote')
                         archive0.archiveWithForward(stageName, take, realOutput, placeholders)
-                    else
+                    }
+                    else {
+                        appendCachedStageEntry(stageName, archiveDirName, null, 'none')
                         forwardOutputs(realOutput, placeholders)
+                    }
                 }
             }
             catch( Exception e ) {
                 log.error "Stage ${stageName} ${cached != null ? 'reuse' : 'execute'} failed mid-operation; aborting session to avoid corrupted output: ${e.message}", e
                 (Global.session as Session)?.abort(e)
                 return
-            }
-
-            // -- Stage 3: audit tsv. Best-effort; failure here is non-fatal.
-            if( cached != null ) {
-                try {
-                    appendCachedStageEntry(stageName, archiveDirName, cached)
-                }
-                catch( Exception e ) {
-                    log.warn "Stage ${stageName}: failed to write cached-stages report: ${e.message}"
-                }
             }
         }
         finally {
@@ -420,4 +453,5 @@ class StageCache {
             this.isValue = isValue
         }
     }
+
 }

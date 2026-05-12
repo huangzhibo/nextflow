@@ -156,12 +156,47 @@ class StageArchive {
     }
 
     /**
+     * Add a {@code task_hashes} list to an existing {@code stage.json}.
+     *
+     * <p>Called once per archived stage at {@link StageTaskObserver#onFlowComplete}
+     * after the dataflow subscriptions have written the archive. Errors are
+     * logged and swallowed — the audit field is best-effort and must not abort
+     * shutdown.
+     */
+    void patchTaskHashes(String stageName, String archiveDirName, List<String> taskHashes) {
+        final stageJson = archivePath(stageName, archiveDirName).resolve('stage.json')
+        if( !Files.isRegularFile(stageJson) ) {
+            log.debug "Cannot patch task_hashes: ${stageJson} not present"
+            return
+        }
+        try {
+            final data = new JsonSlurper().parse(stageJson.toFile()) as Map
+            data.put('task_hashes', taskHashes)
+            final json = JsonOutput.prettyPrint(JsonOutput.toJson(data))
+            Files.write(stageJson, json.getBytes('UTF-8'))
+            log.debug "Patched task_hashes for stage ${stageName}: ${taskHashes.size()} tasks"
+        }
+        catch( Exception e ) {
+            log.warn "Failed to patch task_hashes for stage ${stageName}: ${e.message}"
+        }
+    }
+
+    /**
      * Subscribe once to {@code output}, forwarding each emission to the matching
      * placeholder AND collecting it for archiving. Single subscription avoids
      * the "double consume" problem on {@link groovyx.gpars.dataflow.DataflowQueue}.
      *
      * When all queue channels have completed, persists {@code stage.json} and
      * the per-emission file directories under the take-derived archive dir.
+     *
+     * <p><b>Ordering invariant:</b> the {@code stage.json} write MUST stay inside
+     * the dataflow operator's {@code afterStop} callback registered via
+     * {@link nextflow.extension.DataflowHelper#subscribeImpl}. The session's
+     * {@code joinAllOperators} waits on every such operator before triggering
+     * {@code notifyFlowComplete}, which is what {@link StageTaskObserver} relies
+     * on to guarantee {@code stage.json} is on disk before patching task hashes.
+     * Re-routing the write through an unrelated thread pool, {@code
+     * CompletableFuture}, or fire-and-forget submission would break this.
      */
     void archiveWithForward(String stageName,
                             StageTake take,

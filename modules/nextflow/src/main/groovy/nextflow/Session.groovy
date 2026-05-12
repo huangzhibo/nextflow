@@ -509,6 +509,9 @@ class Session implements ISession {
         final result = new ArrayList<TraceObserverV2>(10)
         this.statsObserver = new WorkflowStatsObserver(this)
         result.add(statsObserver)
+        if( nextflow.cache.stage.StageCache.instance.isEnabled() ) {
+            result.add(new nextflow.cache.stage.StageTaskObserver())
+        }
         for( TraceObserverFactoryV2 f : Plugins.getExtensions(TraceObserverFactoryV2) ) {
             log.debug "Observer factory (v2): ${f.class.simpleName}"
             result.addAll(f.create(this))

@@ -238,6 +238,47 @@ class StageArchiveTest extends Specification {
         data.original == 'keep'
     }
 
+    // -- patchTaskHashes --
+
+    def 'patchTaskHashes adds task_hashes to existing stage.json'() {
+        given:
+        def stageDir = archive.archivePath('ALIGN', 'abcdef1234567890')
+        Files.createDirectories(stageDir)
+        Files.write(stageDir.resolve('stage.json'),
+            JsonOutput.toJson([schema_version: 'v1', stage: 'ALIGN', emit: [:]]).getBytes('UTF-8'))
+
+        when:
+        archive.patchTaskHashes('ALIGN', 'abcdef1234567890', ['91/445199', '13/f7a4af', 'd2/598317'])
+        then:
+        def data = new JsonSlurper().parse(stageDir.resolve('stage.json').toFile()) as Map
+        data.task_hashes == ['91/445199', '13/f7a4af', 'd2/598317']
+        and: 'pre-existing fields preserved'
+        data.schema_version == 'v1'
+        data.stage == 'ALIGN'
+    }
+
+    def 'patchTaskHashes is a no-op when stage.json absent'() {
+        when:
+        archive.patchTaskHashes('NONE', 'abcdef1234567890', ['91/445199'])
+        then: 'does not throw, does not create the file'
+        noExceptionThrown()
+        !Files.exists(archive.archivePath('NONE', 'abcdef1234567890').resolve('stage.json'))
+    }
+
+    def 'patchTaskHashes overwrites a previous task_hashes value'() {
+        given:
+        def stageDir = archive.archivePath('ALIGN', 'abcdef1234567890')
+        Files.createDirectories(stageDir)
+        Files.write(stageDir.resolve('stage.json'),
+            JsonOutput.toJson([schema_version: 'v1', task_hashes: ['old/aaa']]).getBytes('UTF-8'))
+
+        when:
+        archive.patchTaskHashes('ALIGN', 'abcdef1234567890', ['new/bbb', 'new/ccc'])
+        then:
+        def data = new JsonSlurper().parse(stageDir.resolve('stage.json').toFile()) as Map
+        data.task_hashes == ['new/bbb', 'new/ccc']
+    }
+
     // -- scanThisStageArchives --
 
     def 'scanThisStageArchives populates knownChecksums from take.file elements'() {

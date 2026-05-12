@@ -99,9 +99,23 @@ assert_completed() {
 assert_cached_stages() {
     local expected=$1
     local actual=0
-    [[ -f cached-stages.tsv ]] && actual=$(tail -n +2 cached-stages.tsv | wc -l | tr -d ' ')
+    # Count rows where archive column = "read" (reused). "wrote" / "none" rows
+    # exist in the schema but don't count as cache reuse for this assertion.
+    [[ -f cached-stages.tsv ]] && actual=$(tail -n +2 cached-stages.tsv | awk -F'\t' '$5=="read"{c++} END{print c+0}')
     if [[ "$actual" != "$expected" ]]; then
-        echo "  ASSERT FAILED: expected ${expected} cached stages, got ${actual}"
+        echo "  ASSERT FAILED: expected ${expected} archive=read stages, got ${actual}"
+        TEST_FAILED=1
+    fi
+}
+
+# Assert the run produced N "wrote" rows in cached-stages.tsv (writable misses
+# only; "none" rows belong to the readonly-miss case and are excluded).
+assert_miss_stages() {
+    local expected=$1
+    local actual=0
+    [[ -f cached-stages.tsv ]] && actual=$(tail -n +2 cached-stages.tsv | awk -F'\t' '$5=="wrote"{c++} END{print c+0}')
+    if [[ "$actual" != "$expected" ]]; then
+        echo "  ASSERT FAILED: expected ${expected} archive=wrote stages, got ${actual}"
         TEST_FAILED=1
     fi
 }
@@ -116,6 +130,30 @@ assert_file_exists() {
 assert_log_contains() {
     if ! grep -qF "$1" "$LAST_OUTPUT"; then
         echo "  ASSERT FAILED: log does not contain: $1"
+        TEST_FAILED=1
+    fi
+}
+
+# Assert that a stage.json's task_hashes array has at least <expected> entries.
+# task_hashes is patched in at flow-complete time, so only MISS archives carry
+# the field; HIT runs inherit it from the original archiving run.
+assert_task_hashes() {
+    local json=$1
+    local expected=${2:-1}
+    if [[ ! -f "$json" ]]; then
+        echo "  ASSERT FAILED: stage.json not found at $json"
+        TEST_FAILED=1
+        return
+    fi
+    if ! grep -q '"task_hashes"' "$json"; then
+        echo "  ASSERT FAILED: task_hashes field missing in $json"
+        TEST_FAILED=1
+        return
+    fi
+    local count
+    count=$(grep -oE '"[0-9a-f]{2}/[0-9a-f]{6}"' "$json" | wc -l | tr -d ' ')
+    if [[ "$count" -lt "$expected" ]]; then
+        echo "  ASSERT FAILED: task_hashes count=${count} < expected=${expected} in $json"
         TEST_FAILED=1
     fi
 }
@@ -178,6 +216,11 @@ test_basic() {
     align_json=$(find .nf-stage-archive/ALIGN   -name stage.json | head -1)
     assert_stage_json_v1 "$prep_json"
     assert_stage_json_v1 "$align_json"
+    # 2 samples → 2 FASTP tasks under PREPARE and 2 BWA_MEM tasks under ALIGN
+    assert_task_hashes "$prep_json"  2
+    assert_task_hashes "$align_json" 2
+    # Cold run: 2 "wrote" rows (PREPARE, ALIGN)
+    assert_miss_stages 2
 
     between_runs
     $NXF run "${TESTS_DIR}/test-basic.nf" -c stage.config > "$LAST_OUTPUT" 2>&1 || true
